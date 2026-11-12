@@ -1,6 +1,9 @@
 name: Build
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
     inputs:
@@ -75,11 +78,11 @@ jobs:
       - name: Install cross
         run: cargo install cross --version 0.2.5 --locked
 
-      - name: Build linux binary
-        run: bash build/build-images.sh
+      - name: Build linux binary (arm64)
+        run: bash build/build-images.sh arm64
 
-      - name: Package deb
-        run: bash build/package-deb.sh
+      - name: Package deb (arm64)
+        run: bash build/package-deb.sh arm64
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
@@ -89,71 +92,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  windows:
-    runs-on: windows-2022
-    needs: frontend
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download frontend dist
-        uses: actions/download-artifact@v4
-        with:
-          name: web-dist
-          path: web/dist
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Prepare vcpkg and dependencies
-        shell: pwsh
-        run: |
-          $env:VCPKG_ROOT = "C:\vcpkg"
-          $env:VCPKG_DEFAULT_TRIPLET = "x64-windows-static"
-          $env:VCPKG_INSTALLED_DIR = Join-Path $pwd "vcpkg_installed"
-
-          if (-not (Test-Path $env:VCPKG_ROOT)) {
-            git clone https://github.com/microsoft/vcpkg $env:VCPKG_ROOT
-          }
-
-          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
-          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet $env:VCPKG_DEFAULT_TRIPLET --x-install-root="$env:VCPKG_INSTALLED_DIR"
-
-          $tripletRoot = Join-Path $env:VCPKG_INSTALLED_DIR $env:VCPKG_DEFAULT_TRIPLET
-          $env:TURBOJPEG_SOURCE = "explicit"
-          $env:TURBOJPEG_LIB_DIR = Join-Path $tripletRoot "lib"
-          $env:TURBOJPEG_INCLUDE_DIR = Join-Path $tripletRoot "include"
-
-          "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VCPKG_DEFAULT_TRIPLET=$env:VCPKG_DEFAULT_TRIPLET" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "VCPKG_INSTALLED_DIR=$env:VCPKG_INSTALLED_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "TURBOJPEG_SOURCE=$env:TURBOJPEG_SOURCE" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "TURBOJPEG_LIB_DIR=$env:TURBOJPEG_LIB_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "TURBOJPEG_INCLUDE_DIR=$env:TURBOJPEG_INCLUDE_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: windows-msvc-release
-          key: ${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
-
-      - name: Build Windows exe
-        shell: pwsh
-        run: .\build\windows\build.ps1 -Configuration release -Package
-
-      - name: Upload exe
-        uses: actions/upload-artifact@v4
-        with:
-          name: one-kvm-windows-exe
-          path: target/x86_64-pc-windows-msvc/release/one-kvm_*.exe
-          if-no-files-found: error
-          retention-days: 7
-
   release:
     runs-on: ubuntu-22.04
-    needs: [deb, windows]
+    needs: [deb]
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
     timeout-minutes: 30
     permissions:
@@ -172,12 +113,6 @@ jobs:
           name: one-kvm-deb
           path: release-artifacts/deb
 
-      - name: Download exe artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: one-kvm-windows-exe
-          path: release-artifacts/windows
-
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -186,4 +121,4 @@ jobs:
           generate_release_notes: true
           files: |
             release-artifacts/deb/*.deb
-            release-artifacts/windows/*.exe
+

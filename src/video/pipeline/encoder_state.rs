@@ -271,6 +271,8 @@ pub(super) fn build_encoder_state(
     let use_yuyv_direct = is_rkmpp_available
         && rkmpp_is_allowed
         && !needs_mjpeg_decode
+        && crate::platform::is_rk35xx_or_newer()
+        && std::env::var("ONE_KVM_RKMPP_YUYV_DIRECT").as_deref() != Ok("0")
         && config.input_format == PixelFormat::Yuyv;
     let use_rkmpp_direct = is_rkmpp_available
         && rkmpp_is_allowed
@@ -352,6 +354,8 @@ pub(super) fn build_encoder_state(
     #[cfg(feature = "rkmpp")]
     if needs_mjpeg_decode
         && is_rkmpp_encoder
+        && crate::platform::is_rk35xx_or_newer()
+        && std::env::var("ONE_KVM_RKMPP_HW_MJPEG").as_deref() != Ok("0")
         && matches!(
             config.output_codec,
             VideoEncoderType::H264 | VideoEncoderType::H265
@@ -507,18 +511,25 @@ pub(super) fn build_encoder_state(
     };
 
     let codec_name = encoder.codec_name();
+    let rkmpp_supports_direct = crate::platform::is_rk35xx_or_newer()
+        && std::env::var("ONE_KVM_RKMPP_DIRECT_INPUT").as_deref() != Ok("0");
     let use_direct_input = if codec_name.contains("rkmpp") {
-        matches!(
-            pipeline_input_format,
-            PixelFormat::Yuyv
-                | PixelFormat::Yuv420
-                | PixelFormat::Rgb24
-                | PixelFormat::Bgr24
-                | PixelFormat::Nv12
-                | PixelFormat::Nv16
-                | PixelFormat::Nv21
-                | PixelFormat::Nv24
-        )
+        if rkmpp_supports_direct {
+            matches!(
+                pipeline_input_format,
+                PixelFormat::Yuyv
+                    | PixelFormat::Yuv420
+                    | PixelFormat::Rgb24
+                    | PixelFormat::Bgr24
+                    | PixelFormat::Nv12
+                    | PixelFormat::Nv16
+                    | PixelFormat::Nv21
+                    | PixelFormat::Nv24
+            )
+        } else {
+            // Legacy Rockchip VPU (e.g. RK3399) only natively accepts NV12
+            matches!(pipeline_input_format, PixelFormat::Nv12)
+        }
     } else if codec_name.contains("libx264") {
         matches!(
             pipeline_input_format,
@@ -588,16 +599,26 @@ fn h264_direct_input_format(
     input_format: PixelFormat,
 ) -> Option<H264InputFormat> {
     if codec_name.contains("rkmpp") {
-        match input_format {
-            PixelFormat::Yuyv => Some(H264InputFormat::Yuyv422),
-            PixelFormat::Yuv420 => Some(H264InputFormat::Yuv420p),
-            PixelFormat::Rgb24 => Some(H264InputFormat::Rgb24),
-            PixelFormat::Bgr24 => Some(H264InputFormat::Bgr24),
-            PixelFormat::Nv12 => Some(H264InputFormat::Nv12),
-            PixelFormat::Nv16 => Some(H264InputFormat::Nv16),
-            PixelFormat::Nv21 => Some(H264InputFormat::Nv21),
-            PixelFormat::Nv24 => Some(H264InputFormat::Nv24),
-            _ => None,
+        if crate::platform::is_rk35xx_or_newer()
+            && std::env::var("ONE_KVM_RKMPP_DIRECT_INPUT").as_deref() != Ok("0")
+        {
+            match input_format {
+                PixelFormat::Yuyv => Some(H264InputFormat::Yuyv422),
+                PixelFormat::Yuv420 => Some(H264InputFormat::Yuv420p),
+                PixelFormat::Rgb24 => Some(H264InputFormat::Rgb24),
+                PixelFormat::Bgr24 => Some(H264InputFormat::Bgr24),
+                PixelFormat::Nv12 => Some(H264InputFormat::Nv12),
+                PixelFormat::Nv16 => Some(H264InputFormat::Nv16),
+                PixelFormat::Nv21 => Some(H264InputFormat::Nv21),
+                PixelFormat::Nv24 => Some(H264InputFormat::Nv24),
+                _ => None,
+            }
+        } else {
+            // Legacy Rockchip VPU (RK3399) only directly accepts NV12
+            match input_format {
+                PixelFormat::Nv12 => Some(H264InputFormat::Nv12),
+                _ => None,
+            }
         }
     } else if codec_name.contains("libx264") {
         match input_format {
@@ -617,16 +638,26 @@ fn h265_direct_input_format(
     input_format: PixelFormat,
 ) -> Option<H265InputFormat> {
     if codec_name.contains("rkmpp") {
-        match input_format {
-            PixelFormat::Yuyv => Some(H265InputFormat::Yuyv422),
-            PixelFormat::Yuv420 => Some(H265InputFormat::Yuv420p),
-            PixelFormat::Rgb24 => Some(H265InputFormat::Rgb24),
-            PixelFormat::Bgr24 => Some(H265InputFormat::Bgr24),
-            PixelFormat::Nv12 => Some(H265InputFormat::Nv12),
-            PixelFormat::Nv16 => Some(H265InputFormat::Nv16),
-            PixelFormat::Nv21 => Some(H265InputFormat::Nv21),
-            PixelFormat::Nv24 => Some(H265InputFormat::Nv24),
-            _ => None,
+        if crate::platform::is_rk35xx_or_newer()
+            && std::env::var("ONE_KVM_RKMPP_DIRECT_INPUT").as_deref() != Ok("0")
+        {
+            match input_format {
+                PixelFormat::Yuyv => Some(H265InputFormat::Yuyv422),
+                PixelFormat::Yuv420 => Some(H265InputFormat::Yuv420p),
+                PixelFormat::Rgb24 => Some(H265InputFormat::Rgb24),
+                PixelFormat::Bgr24 => Some(H265InputFormat::Bgr24),
+                PixelFormat::Nv12 => Some(H265InputFormat::Nv12),
+                PixelFormat::Nv16 => Some(H265InputFormat::Nv16),
+                PixelFormat::Nv21 => Some(H265InputFormat::Nv21),
+                PixelFormat::Nv24 => Some(H265InputFormat::Nv24),
+                _ => None,
+            }
+        } else {
+            // Legacy Rockchip VPU (RK3399) only directly accepts NV12
+            match input_format {
+                PixelFormat::Nv12 => Some(H265InputFormat::Nv12),
+                _ => None,
+            }
         }
     } else if codec_name.contains("libx265") {
         match input_format {

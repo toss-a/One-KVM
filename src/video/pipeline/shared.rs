@@ -45,7 +45,7 @@ fn rkmpp_dma_eligible(
     codec: VideoEncoderType,
     format: PixelFormat,
 ) -> bool {
-    backend == Some(EncoderBackend::Rkmpp)
+    let base = backend == Some(EncoderBackend::Rkmpp)
         && matches!(codec, VideoEncoderType::H264 | VideoEncoderType::H265)
         && matches!(
             format,
@@ -54,7 +54,15 @@ fn rkmpp_dma_eligible(
                 | PixelFormat::Yuyv
                 | PixelFormat::Rgb24
                 | PixelFormat::Mjpeg
-        )
+        );
+    if !base {
+        return false;
+    }
+    // Legacy Rockchip VPU (e.g. RK3399) does not support direct YUYV/RGB DMA import into MPP encoder
+    if !crate::platform::is_rk35xx_or_newer() && format != PixelFormat::Nv12 {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
