@@ -95,18 +95,11 @@ jobs:
   release:
     runs-on: ubuntu-22.04
     needs: [deb]
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+    if: ${{ github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.publish_release) }}
     timeout-minutes: 30
     permissions:
       contents: write
     steps:
-      - name: Validate release tag
-        run: |
-          if [ -z "${{ inputs.release_tag }}" ]; then
-            echo "release_tag is required when publish_release is true"
-            exit 1
-          fi
-
       - name: Download deb artifact
         uses: actions/download-artifact@v4
         with:
@@ -116,7 +109,8 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag }}
+          tag_name: ${{ inputs.release_tag || 'latest' }}
+          name: ${{ inputs.release_tag || 'Latest Build' }}
           prerelease: true
           generate_release_notes: true
           files: |

@@ -12,7 +12,7 @@ use bytes::Bytes;
 use hwcodec::ffmpeg_hw::{
     last_error_message as ffmpeg_hw_last_error, HwMjpegH26xConfig, HwMjpegH26xPipeline,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use super::shared::SharedVideoPipelineConfig;
 
@@ -242,7 +242,9 @@ pub(super) fn should_parallel_decode_mjpeg(config: &SharedVideoPipelineConfig) -
         Some(backend) => registry.encoder_with_backend(config.output_codec, backend),
         None => registry.best_available_encoder(config.output_codec),
     };
-    selected.is_some_and(|encoder| encoder.backend == EncoderBackend::V4l2m2m)
+    selected.is_some_and(|encoder| {
+        encoder.backend == EncoderBackend::V4l2m2m || encoder.backend == EncoderBackend::Rkmpp
+    })
 }
 
 pub(super) fn build_encoder_state(
@@ -354,7 +356,6 @@ pub(super) fn build_encoder_state(
     #[cfg(feature = "rkmpp")]
     if needs_mjpeg_decode
         && is_rkmpp_encoder
-        && crate::platform::is_rk35xx_or_newer()
         && std::env::var("ONE_KVM_RKMPP_HW_MJPEG").as_deref() != Ok("0")
         && matches!(
             config.output_codec,
@@ -362,10 +363,10 @@ pub(super) fn build_encoder_state(
         )
     {
         info!(
-            "Initializing FFmpeg HW MJPEG->{} pipeline (no fallback)",
+            "Initializing hardware MJPEG->{} pipeline",
             config.output_codec
         );
-        let pipeline = HwMjpegH26xPipeline::new(HwMjpegH26xConfig {
+        match HwMjpegH26xPipeline::new(HwMjpegH26xConfig {
             decoder: "mjpeg_rkmpp".to_string(),
             encoder: selected_codec_name.clone(),
             width: config.resolution.width as i32,
@@ -374,33 +375,36 @@ pub(super) fn build_encoder_state(
             bitrate_kbps: config.bitrate_kbps() as i32,
             gop: config.gop_size() as i32,
             thread_count: 1,
-        })
-        .map_err(|e| {
-            let detail = if e.is_empty() {
-                ffmpeg_hw_last_error()
-            } else {
-                e
-            };
-            AppError::VideoError(format!(
-                "FFmpeg HW MJPEG->{} init failed: {}",
-                config.output_codec, detail
-            ))
-        })?;
-        info!("Using FFmpeg HW MJPEG->{} pipeline", config.output_codec);
-        return Ok(EncoderThreadState {
-            encoder: None,
-            mjpeg_decoder: None,
-            nv12_converter: None,
-            yuv420p_converter: None,
-            encoder_needs_yuv420p: false,
-            #[cfg(feature = "rkmpp")]
-            ffmpeg_hw_pipeline: Some(pipeline),
-            #[cfg(feature = "rkmpp")]
-            ffmpeg_hw_enabled: true,
-            fps: config.fps,
-            codec: config.output_codec,
-            input_format: config.input_format,
-        });
+        }) {
+            Ok(pipeline) => {
+                info!("Using hardware MJPEG->{} pipeline", config.output_codec);
+                return Ok(EncoderThreadState {
+                    encoder: None,
+                    mjpeg_decoder: None,
+                    nv12_converter: None,
+                    yuv420p_converter: None,
+                    encoder_needs_yuv420p: false,
+                    #[cfg(feature = "rkmpp")]
+                    ffmpeg_hw_pipeline: Some(pipeline),
+                    #[cfg(feature = "rkmpp")]
+                    ffmpeg_hw_enabled: true,
+                    fps: config.fps,
+                    codec: config.output_codec,
+                    input_format: config.input_format,
+                });
+            }
+            Err(e) => {
+                let detail = if e.is_empty() {
+                    ffmpeg_hw_last_error()
+                } else {
+                    e
+                };
+                warn!(
+                    "Hardware MJPEG->{} pipeline init failed: {}, falling back to software decode",
+                    config.output_codec, detail
+                );
+            }
+        }
     }
 
     let (mjpeg_decoder, pipeline_input_format) = if needs_mjpeg_decode {
