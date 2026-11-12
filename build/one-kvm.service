@@ -9,6 +9,8 @@ Type=simple
 User=root
 # Example for older Intel GPUs:
 # Environment=LIBVA_DRIVER_NAME=i965
+# Example for Rockchip legacy VPUs (e.g. RK3399/RK3328/RK3288, auto-detected by default):
+# Environment="ONE_KVM_RKMPP_LEGACY_VPU=1"
 ExecStart=/usr/bin/one-kvm
 Restart=on-failure
 RestartSec=5
