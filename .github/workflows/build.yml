@@ -1,6 +1,11 @@
 name: Build
 
 on:
+  push:
+    branches:
+      - main
+      - dev
+      - "fix/**"
   pull_request:
   workflow_dispatch:
     inputs:
