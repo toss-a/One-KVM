@@ -111,6 +111,7 @@ static int init_decoder(FfmpegHwMjpegH26xCtx *ctx) {
 
   ctx->dec_ctx->hw_device_ctx = av_buffer_ref(ctx->hw_device_ctx);
   ctx->dec_ctx->get_format = get_hw_format;
+  ctx->dec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 
   ret = avcodec_open2(ctx->dec_ctx, dec, NULL);
   if (ret < 0) {
@@ -256,12 +257,12 @@ extern "C" FfmpegHwMjpegH26x* ffmpeg_hw_mjpeg_h26x_new(const char* dec_name,
 }
 
 extern "C" int ffmpeg_hw_mjpeg_h26x_encode(FfmpegHwMjpegH26x* handle,
-                                             const uint8_t* data,
-                                             int len,
-                                             int64_t pts_ms,
-                                             uint8_t** out_data,
-                                             int* out_len,
-                                             int* out_keyframe) {
+                                           const uint8_t* data,
+                                           int len,
+                                           int64_t pts_ms,
+                                           uint8_t** out_data,
+                                           int* out_len,
+                                           int* out_keyframe) {
   if (!handle || !data || len <= 0 || !out_data || !out_len || !out_keyframe) {
     set_last_error("Invalid parameters for encode");
     return -1;
@@ -282,133 +283,151 @@ extern "C" int ffmpeg_hw_mjpeg_h26x_encode(FfmpegHwMjpegH26x* handle,
   memcpy(ctx->dec_pkt->data, data, len);
   ctx->dec_pkt->size = len;
 
+  auto drain_and_encode = [&]() -> int {
+    while (true) {
+      int r = avcodec_receive_frame(ctx->dec_ctx, ctx->dec_frame);
+      if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
+        return 0;
+      }
+      if (r < 0) {
+        set_last_error(make_err("avcodec_receive_frame failed", r));
+        return -1;
+      }
+
+      if (ctx->dec_frame->format != AV_PIX_FMT_DRM_PRIME) {
+        set_last_error("Decoder output is not DRM_PRIME");
+        av_frame_unref(ctx->dec_frame);
+        return -1;
+      }
+
+      if (!ctx->enc_ctx) {
+        if (!ctx->dec_frame->hw_frames_ctx) {
+          set_last_error("Decoder returned frame without hw_frames_ctx");
+          av_frame_unref(ctx->dec_frame);
+          return -1;
+        }
+        if (init_encoder(ctx, ctx->dec_frame->hw_frames_ctx) != 0) {
+          av_frame_unref(ctx->dec_frame);
+          return -1;
+        }
+      }
+
+      AVFrame *send_frame = ctx->dec_frame;
+      AVFrame *tmp = nullptr;
+      if (ctx->force_keyframe) {
+        tmp = av_frame_clone(send_frame);
+        if (tmp) {
+          tmp->pict_type = AV_PICTURE_TYPE_I;
+          send_frame = tmp;
+        }
+        ctx->force_keyframe = false;
+      }
+
+      // Apply visible size crop if aligned buffer is larger than display size
+      if (ctx->aligned_width > 0 && ctx->width > 0 && ctx->aligned_width > ctx->width) {
+        send_frame->crop_right = ctx->aligned_width - ctx->width;
+      }
+      if (ctx->aligned_height > 0 && ctx->height > 0 && ctx->aligned_height > ctx->height) {
+        send_frame->crop_bottom = ctx->aligned_height - ctx->height;
+      }
+
+      send_frame->pts = pts_ms; // time_base is ms
+
+      r = avcodec_send_frame(ctx->enc_ctx, send_frame);
+      if (tmp) {
+        av_frame_free(&tmp);
+      }
+      if (r < 0) {
+        std::string detail = "avcodec_send_frame failed";
+        if (send_frame) {
+          detail += " frame_fmt=";
+          detail += pix_fmt_name(static_cast<AVPixelFormat>(send_frame->format));
+          detail += " w=" + std::to_string(send_frame->width);
+          detail += " h=" + std::to_string(send_frame->height);
+          if (send_frame->format == AV_PIX_FMT_DRM_PRIME && send_frame->data[0]) {
+            const AVDRMFrameDescriptor *drm =
+                reinterpret_cast<const AVDRMFrameDescriptor *>(send_frame->data[0]);
+            if (drm && drm->layers[0].format) {
+              detail += " drm_fmt=0x";
+              char buf[9];
+              snprintf(buf, sizeof(buf), "%08x", drm->layers[0].format);
+              detail += buf;
+            }
+            if (drm && drm->objects[0].format_modifier) {
+              detail += " drm_mod=0x";
+              char buf[17];
+              snprintf(buf, sizeof(buf), "%016llx",
+                       (unsigned long long)drm->objects[0].format_modifier);
+              detail += buf;
+            }
+          }
+        }
+        set_last_error(make_err(detail, r));
+        av_frame_unref(ctx->dec_frame);
+        return -1;
+      }
+
+      while (true) {
+        av_packet_unref(ctx->enc_pkt);
+        r = avcodec_receive_packet(ctx->enc_ctx, ctx->enc_pkt);
+        if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) {
+          break;
+        }
+        if (r < 0) {
+          set_last_error(make_err("avcodec_receive_packet failed", r));
+          av_packet_unref(ctx->enc_pkt);
+          av_frame_unref(ctx->dec_frame);
+          return -1;
+        }
+
+        if (ctx->enc_pkt->size <= 0) {
+          set_last_error("avcodec_receive_packet failed, pkt size is 0");
+          av_packet_unref(ctx->enc_pkt);
+          av_frame_unref(ctx->dec_frame);
+          return -1;
+        }
+
+        if (!encoded) {
+          uint8_t *buf = (uint8_t*)malloc(ctx->enc_pkt->size);
+          if (!buf) {
+            set_last_error("malloc for output packet failed");
+            av_packet_unref(ctx->enc_pkt);
+            av_frame_unref(ctx->dec_frame);
+            return -1;
+          }
+          memcpy(buf, ctx->enc_pkt->data, ctx->enc_pkt->size);
+          *out_data = buf;
+          *out_len = ctx->enc_pkt->size;
+          *out_keyframe = (ctx->enc_pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
+          encoded = true;
+        }
+      }
+
+      av_frame_unref(ctx->dec_frame);
+    }
+    return 0;
+  };
+
   ret = avcodec_send_packet(ctx->dec_ctx, ctx->dec_pkt);
+  if (ret == AVERROR(EAGAIN)) {
+    // Input is temporarily not accepted because decoder internal buffer is full.
+    // Drain available frames first, then retry sending packet.
+    if (drain_and_encode() < 0) {
+      return -1;
+    }
+    ret = avcodec_send_packet(ctx->dec_ctx, ctx->dec_pkt);
+  }
+
   if (ret < 0) {
     set_last_error(make_err("avcodec_send_packet failed", ret));
     return -1;
   }
 
-  while (true) {
-    ret = avcodec_receive_frame(ctx->dec_ctx, ctx->dec_frame);
-    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-      return encoded ? 1 : 0;
-    }
-    if (ret < 0) {
-      set_last_error(make_err("avcodec_receive_frame failed", ret));
-      return -1;
-    }
-
-    if (ctx->dec_frame->format != AV_PIX_FMT_DRM_PRIME) {
-      set_last_error("Decoder output is not DRM_PRIME");
-      av_frame_unref(ctx->dec_frame);
-      return -1;
-    }
-
-    if (!ctx->enc_ctx) {
-      if (!ctx->dec_frame->hw_frames_ctx) {
-        set_last_error("Decoder returned frame without hw_frames_ctx");
-        av_frame_unref(ctx->dec_frame);
-        return -1;
-      }
-      if (init_encoder(ctx, ctx->dec_frame->hw_frames_ctx) != 0) {
-        av_frame_unref(ctx->dec_frame);
-        return -1;
-      }
-    }
-
-    AVFrame *send_frame = ctx->dec_frame;
-    AVFrame *tmp = nullptr;
-    if (ctx->force_keyframe) {
-      tmp = av_frame_clone(send_frame);
-      if (tmp) {
-        tmp->pict_type = AV_PICTURE_TYPE_I;
-        send_frame = tmp;
-      }
-      ctx->force_keyframe = false;
-    }
-
-    // Apply visible size crop if aligned buffer is larger than display size
-    if (ctx->aligned_width > 0 && ctx->width > 0 && ctx->aligned_width > ctx->width) {
-      send_frame->crop_right = ctx->aligned_width - ctx->width;
-    }
-    if (ctx->aligned_height > 0 && ctx->height > 0 && ctx->aligned_height > ctx->height) {
-      send_frame->crop_bottom = ctx->aligned_height - ctx->height;
-    }
-
-    send_frame->pts = pts_ms; // time_base is ms
-
-    ret = avcodec_send_frame(ctx->enc_ctx, send_frame);
-    if (tmp) {
-      av_frame_free(&tmp);
-    }
-    if (ret < 0) {
-      std::string detail = "avcodec_send_frame failed";
-      if (send_frame) {
-        detail += " frame_fmt=";
-        detail += pix_fmt_name(static_cast<AVPixelFormat>(send_frame->format));
-        detail += " w=" + std::to_string(send_frame->width);
-        detail += " h=" + std::to_string(send_frame->height);
-        if (send_frame->format == AV_PIX_FMT_DRM_PRIME && send_frame->data[0]) {
-          const AVDRMFrameDescriptor *drm =
-              reinterpret_cast<const AVDRMFrameDescriptor *>(send_frame->data[0]);
-          if (drm && drm->layers[0].format) {
-            detail += " drm_fmt=0x";
-            char buf[9];
-            snprintf(buf, sizeof(buf), "%08x", drm->layers[0].format);
-            detail += buf;
-          }
-          if (drm && drm->objects[0].format_modifier) {
-            detail += " drm_mod=0x";
-            char buf[17];
-            snprintf(buf, sizeof(buf), "%016llx",
-                     (unsigned long long)drm->objects[0].format_modifier);
-            detail += buf;
-          }
-        }
-      }
-      set_last_error(make_err(detail, ret));
-      av_frame_unref(ctx->dec_frame);
-      return -1;
-    }
-
-    while (true) {
-      av_packet_unref(ctx->enc_pkt);
-      ret = avcodec_receive_packet(ctx->enc_ctx, ctx->enc_pkt);
-      if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-        break;
-      }
-      if (ret < 0) {
-        set_last_error(make_err("avcodec_receive_packet failed", ret));
-        av_packet_unref(ctx->enc_pkt);
-        av_frame_unref(ctx->dec_frame);
-        return -1;
-      }
-
-      if (ctx->enc_pkt->size <= 0) {
-        set_last_error("avcodec_receive_packet failed, pkt size is 0");
-        av_packet_unref(ctx->enc_pkt);
-        av_frame_unref(ctx->dec_frame);
-        return -1;
-      }
-
-      if (!encoded) {
-        uint8_t *buf = (uint8_t*)malloc(ctx->enc_pkt->size);
-        if (!buf) {
-          set_last_error("malloc for output packet failed");
-          av_packet_unref(ctx->enc_pkt);
-          av_frame_unref(ctx->dec_frame);
-          return -1;
-        }
-        memcpy(buf, ctx->enc_pkt->data, ctx->enc_pkt->size);
-        *out_data = buf;
-        *out_len = ctx->enc_pkt->size;
-        *out_keyframe = (ctx->enc_pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0;
-        encoded = true;
-      }
-    }
-
-    av_frame_unref(ctx->dec_frame);
+  if (drain_and_encode() < 0) {
+    return -1;
   }
+
+  return encoded ? 1 : 0;
 }
 
 extern "C" int ffmpeg_hw_mjpeg_h26x_reconfigure(FfmpegHwMjpegH26x* handle,
