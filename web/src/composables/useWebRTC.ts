@@ -713,6 +713,9 @@ export function useWebRTC() {
 
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', () => {
-    disconnect()
+    void disconnect()
+  })
+  window.addEventListener('pagehide', () => {
+    void disconnect()
   })
 }

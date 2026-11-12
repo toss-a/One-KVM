@@ -399,11 +399,22 @@ export const webrtcApi = {
       sessions: Array<{ session_id: string; state: string }>
     }>('/webrtc/status'),
 
-  close: (sessionId: string) =>
-    request<{ success: boolean }>('/webrtc/close', {
+  close: (sessionId: string) => {
+    const body = JSON.stringify({ session_id: sessionId })
+    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      try {
+        const blob = new Blob([body], { type: 'application/json' })
+        navigator.sendBeacon(`${API_BASE}/webrtc/close`, blob)
+      } catch {
+        // Fall back to keepalive fetch
+      }
+    }
+    return request<{ success: boolean }>('/webrtc/close', {
       method: 'POST',
-      body: JSON.stringify({ session_id: sessionId }),
-    }),
+      body,
+      keepalive: true,
+    }, { toastOnError: false })
+  },
 
   getIceServers: () =>
     request<{ ice_servers: IceServerConfig[]; mdns_mode: string }>('/webrtc/ice-servers'),

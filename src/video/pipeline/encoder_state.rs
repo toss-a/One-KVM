@@ -242,6 +242,12 @@ pub(super) fn should_parallel_decode_mjpeg(config: &SharedVideoPipelineConfig) -
         Some(backend) => registry.encoder_with_backend(config.output_codec, backend),
         None => registry.best_available_encoder(config.output_codec),
     };
+    #[cfg(feature = "rkmpp")]
+    if std::env::var("ONE_KVM_RKMPP_HW_MJPEG").as_deref() != Ok("0")
+        && selected.as_ref().is_some_and(|e| e.backend == EncoderBackend::Rkmpp)
+    {
+        return false;
+    }
     selected.is_some_and(|encoder| {
         encoder.backend == EncoderBackend::V4l2m2m || encoder.backend == EncoderBackend::Rkmpp
     })

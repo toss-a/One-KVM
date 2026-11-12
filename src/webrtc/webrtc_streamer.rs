@@ -137,6 +137,21 @@ impl WebRtcStreamer {
         });
         let weak = Arc::downgrade(&streamer);
         *streamer.self_weak.write().expect("self_weak write") = Some(weak);
+
+        // Periodically cleanup closed / disconnected sessions every 2 seconds
+        let cleanup_weak = streamer.self_weak();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                interval.tick().await;
+                if let Some(streamer) = cleanup_weak.upgrade() {
+                    streamer.cleanup().await;
+                } else {
+                    break;
+                }
+            }
+        });
+
         streamer
     }
 
@@ -1225,13 +1240,21 @@ impl WebRtcStreamer {
         };
 
         if !to_remove.is_empty() {
-            let mut sessions = self.sessions.write().await;
-            for id in &to_remove {
-                debug!("Removing closed session: {}", id);
-                sessions.remove(id);
+            let mut removed_sessions = Vec::new();
+            {
+                let mut sessions = self.sessions.write().await;
+                for id in &to_remove {
+                    debug!("Removing closed session: {}", id);
+                    if let Some(session) = sessions.remove(id) {
+                        removed_sessions.push(session);
+                    }
+                }
             }
 
-            drop(sessions);
+            for session in removed_sessions {
+                let _ = session.close().await;
+            }
+
             self.stop_pipeline_if_idle("After cleanup_closed_sessions")
                 .await;
         }

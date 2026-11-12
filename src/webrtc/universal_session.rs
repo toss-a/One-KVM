@@ -897,10 +897,12 @@ impl UniversalSession {
     pub async fn close(&self) -> Result<()> {
         if let Some(handle) = self.video_receiver_handle.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
         }
 
         if let Some(handle) = self.audio_receiver_handle.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
         }
 
         if let Err(e) = self.pc.close().await {
