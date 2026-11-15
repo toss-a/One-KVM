@@ -495,6 +495,7 @@ extern "C" int rkmpp_native_mjpeg_h264_encode(
     void *in_ptr = mpp_buffer_get_ptr(p->in_buf);
     if (!in_ptr) return fail("JPEG packet buffer ptr", -1);
     std::memcpy(in_ptr, jpeg_data, jpeg_len);
+    (void)mpp_buffer_sync_end(p->in_buf);
 
     MppPacket dec_pkt = nullptr;
     int ret = mpp_packet_init_with_buffer(&dec_pkt, p->in_buf);
@@ -803,6 +804,7 @@ extern "C" int rkmpp_native_enc_encode(
         if (ret) return fail("MPP_ENC_SET_IDR_FRAME", ret);
     }
 
+    (void)mpp_buffer_sync_end(e->frm_buf);
     mpp_frame_set_eos(e->frame, 0);
     mpp_frame_set_pts(e->frame, pts_us);
 

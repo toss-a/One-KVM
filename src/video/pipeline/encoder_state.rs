@@ -241,11 +241,64 @@ impl VideoEncoderTrait for NativeMppEncoderWrapper {
     }
 }
 
+fn is_rk33xx_soc() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::OnceLock;
+        static IS_RK33XX: OnceLock<bool> = OnceLock::new();
+        *IS_RK33XX.get_or_init(|| {
+            for path in [
+                "/proc/device-tree/compatible",
+                "/sys/firmware/devicetree/base/compatible",
+            ] {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if bytes.windows(4).any(|w| w == b"rk33") {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "rkmpp"))]
+fn to_native_rkmpp_format(input_format: H264InputFormat) -> H264InputFormat {
+    match input_format {
+        H264InputFormat::Yuyv422 => H264InputFormat::Yuyv422,
+        H264InputFormat::Yuv420p => H264InputFormat::Yuv420p,
+        _ => H264InputFormat::Nv12,
+    }
+}
+
 fn create_h264_encoder(
     config: &SharedVideoPipelineConfig,
     input_format: H264InputFormat,
     codec_name: &str,
 ) -> Result<Box<dyn VideoEncoderTrait + Send>> {
+    // On RK33xx (e.g. RK3399 VEPU), FFmpeg's h264_rkmpp passes unaligned ver_stride
+    // for 1080p raw frames (0x3f4800 < 0x3fc000). Prefer NativeMppEncoder which
+    // allocates 16-aligned planes cleanly unless explicitly forced to ffmpeg mode.
+    #[cfg(all(target_os = "linux", feature = "rkmpp"))]
+    if codec_name.contains("rkmpp")
+        && is_rk33xx_soc()
+        && std::env::var("ONE_KVM_RKMPP_MODE").as_deref() != Ok("ffmpeg")
+    {
+        if let Ok(native) =
+            NativeMppEncoderWrapper::new(config, to_native_rkmpp_format(input_format))
+        {
+            info!(
+                "Created H264 encoder: {} (RK33xx aligned native MPP)",
+                native.codec_name()
+            );
+            return Ok(Box::new(native));
+        }
+    }
+
     match H264Encoder::with_codec(
         H264Config {
             base: EncoderConfig::h264(config.resolution, config.bitrate_kbps()),
@@ -267,16 +320,13 @@ fn create_h264_encoder(
         Err(err) => {
             #[cfg(all(target_os = "linux", feature = "rkmpp"))]
             if codec_name.contains("rkmpp") {
-                let native_fmt = match input_format {
-                    H264InputFormat::Yuyv422 => H264InputFormat::Yuyv422,
-                    H264InputFormat::Yuv420p => H264InputFormat::Yuv420p,
-                    _ => H264InputFormat::Nv12,
-                };
                 warn!(
                     "FFmpeg RKMPP encoder ({}) failed ({}), falling back to native MPP C API",
                     codec_name, err
                 );
-                if let Ok(native) = NativeMppEncoderWrapper::new(config, native_fmt) {
+                if let Ok(native) =
+                    NativeMppEncoderWrapper::new(config, to_native_rkmpp_format(input_format))
+                {
                     info!("Created H264 encoder: {}", native.codec_name());
                     return Ok(Box::new(native));
                 }
@@ -407,9 +457,17 @@ pub(super) fn should_parallel_decode_mjpeg(config: &SharedVideoPipelineConfig) -
         None => registry.best_available_encoder(config.output_codec),
     };
     selected.is_some_and(|encoder| {
-        encoder.backend == EncoderBackend::V4l2m2m
-            || (encoder.backend == EncoderBackend::Rkmpp
-                && std::env::var("ONE_KVM_RKMPP_MODE").as_deref() == Ok("turbojpeg"))
+        if encoder.backend == EncoderBackend::V4l2m2m {
+            return true;
+        }
+        if encoder.backend == EncoderBackend::Rkmpp {
+            return match std::env::var("ONE_KVM_RKMPP_MODE").as_deref() {
+                Ok("turbojpeg") => true,
+                Ok("native") | Ok("ffmpeg") => false,
+                _ => is_rk33xx_soc(),
+            };
+        }
+        false
     })
 }
 
