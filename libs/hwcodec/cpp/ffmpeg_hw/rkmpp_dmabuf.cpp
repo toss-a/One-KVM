@@ -78,6 +78,23 @@ struct RkmppDmaEncoder {
     ~RkmppDmaEncoder() { close(); }
 };
 
+static int alloc_mpp_buffer_group(MppBufferGroup *grp) {
+    const MppBufferType types[] = {
+        static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE),
+        MPP_BUFFER_TYPE_DRM,
+        MPP_BUFFER_TYPE_ION,
+        MPP_BUFFER_TYPE_NORMAL,
+    };
+    int ret = -1;
+    for (MppBufferType type : types) {
+        ret = mpp_buffer_group_get_internal(grp, type);
+        if (ret == 0 && *grp) {
+            return 0;
+        }
+    }
+    return ret;
+}
+
 static bool set_cfg(RkmppDmaEncoder *e, const char *key, int value) {
     int ret = mpp_enc_cfg_set_s32(e->cfg, key, value);
     if (ret) fail(key, ret);
@@ -119,10 +136,8 @@ extern "C" RkmppDmaEncoder *rkmpp_dma_new(
     int ret = mpp_create(&e->ctx, &e->api);
     if (ret) return abort_init("mpp_create", ret);
     RK_S64 timeout = 2000;
-    ret = e->api->control(e->ctx, MPP_SET_OUTPUT_TIMEOUT, &timeout);
-    if (ret) return abort_init("MPP_SET_OUTPUT_TIMEOUT", ret);
-    ret = e->api->control(e->ctx, MPP_SET_INPUT_TIMEOUT, &timeout);
-    if (ret) return abort_init("MPP_SET_INPUT_TIMEOUT", ret);
+    (void)e->api->control(e->ctx, MPP_SET_OUTPUT_TIMEOUT, &timeout);
+    (void)e->api->control(e->ctx, MPP_SET_INPUT_TIMEOUT, &timeout);
     ret = mpp_init(e->ctx, MPP_CTX_ENC, codec ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC);
     if (ret) return abort_init("mpp_init", ret);
     ret = mpp_enc_cfg_init(&e->cfg);
@@ -177,7 +192,7 @@ extern "C" RkmppDmaEncoder *rkmpp_dma_new(
         MppFrameFormat output = MPP_FMT_YUV420SP;
         ret = e->dec_api->control(e->decoder, MPP_DEC_SET_OUTPUT_FORMAT, &output);
         if (ret) return abort_init("JPEG NV12 output", ret);
-        ret = mpp_buffer_group_get_internal(&e->decoded_group, MPP_BUFFER_TYPE_DRM);
+        ret = alloc_mpp_buffer_group(&e->decoded_group);
         if (ret) return abort_init("JPEG output buffer group", ret);
         // MPP JPEG requires aligned storage; reserve the conservative size used
         // by its advanced-task decoder demo. One output reused after encode.
