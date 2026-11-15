@@ -214,6 +214,14 @@ static int dma_read_sync(MppBuffer buffer, bool start) {
     return ret;
 }
 
+static void dma_flush_for_device(MppBuffer buffer) {
+    dma_buf_sync sync{};
+    sync.flags = DMA_BUF_SYNC_RW | DMA_BUF_SYNC_END;
+    int ret;
+    do { ret = ioctl(mpp_buffer_get_fd(buffer), DMA_BUF_IOCTL_SYNC, &sync); }
+    while (ret < 0 && errno == EINTR);
+}
+
 static int decode_jpeg(RkmppDmaEncoder *e, size_t index, size_t bytes_used) {
     MppBuffer input = e->buffers[index];
     // The parser reads only header bytes with explicit DMA CPU-read ownership.
@@ -303,6 +311,8 @@ extern "C" int rkmpp_dma_encode(RkmppDmaEncoder *e, size_t index, size_t bytes_u
     if (e->jpeg && decode_jpeg(e, index, bytes_used)) {
         // Preserve the detailed decoder failure while ending BOTH engines.
         e->close(); return -1;
+    } else if (!e->jpeg) {
+        dma_flush_for_device(e->buffers[index]);
     }
     if (force_idr) {
         int ret = e->api->control(e->ctx, MPP_ENC_SET_IDR_FRAME, nullptr);

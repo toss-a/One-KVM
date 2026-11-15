@@ -406,7 +406,11 @@ pub(super) fn should_parallel_decode_mjpeg(config: &SharedVideoPipelineConfig) -
         Some(backend) => registry.encoder_with_backend(config.output_codec, backend),
         None => registry.best_available_encoder(config.output_codec),
     };
-    selected.is_some_and(|encoder| encoder.backend == EncoderBackend::V4l2m2m)
+    selected.is_some_and(|encoder| {
+        encoder.backend == EncoderBackend::V4l2m2m
+            || (encoder.backend == EncoderBackend::Rkmpp
+                && std::env::var("ONE_KVM_RKMPP_MODE").as_deref() == Ok("turbojpeg"))
+    })
 }
 
 pub(super) fn build_encoder_state(
@@ -522,7 +526,7 @@ pub(super) fn build_encoder_state(
         )
     {
         let rkmpp_mode = std::env::var("ONE_KVM_RKMPP_MODE").unwrap_or_default();
-        if rkmpp_mode != "native" {
+        if rkmpp_mode != "native" && rkmpp_mode != "turbojpeg" {
             info!(
                 "Initializing FFmpeg HW MJPEG->{} pipeline",
                 config.output_codec
@@ -568,7 +572,10 @@ pub(super) fn build_encoder_state(
         }
 
         #[cfg(target_os = "linux")]
-        if config.output_codec == VideoEncoderType::H264 && rkmpp_mode != "ffmpeg" {
+        if config.output_codec == VideoEncoderType::H264
+            && rkmpp_mode != "ffmpeg"
+            && rkmpp_mode != "turbojpeg"
+        {
             match NativeMppMjpegH264::new(NativeMppConfig {
                 width: config.resolution.width,
                 height: config.resolution.height,
