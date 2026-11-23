@@ -1,10 +1,10 @@
 #ifndef CEDARC_ABI_H
 #define CEDARC_ABI_H
 
-// Self-contained ABI definitions for Allwinner CedarC v2 (libvencoder.so),
-// verified against libcedarc-dev-2.0.0-arm64 (Allwinner A733 / sun60iw2p1).
-// Loaded dynamically via dlopen("libvencoder.so") so builds do not require
-// Allwinner vendor headers or libraries at compile time.
+// Self-contained ABI definitions for Allwinner CedarC v2 (libvencoder.so,
+// libvdecoder.so, libMemAdapter.so), verified against libcedarc-dev-2.0.0-arm64
+// (Allwinner A733 / sun60iw2p1). Loaded dynamically via dlopen() so builds do
+// not require Allwinner vendor headers or libraries at compile time.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -382,6 +382,243 @@ struct VencAllocateBufferParam {
 
 using VideoEncoder = void *;
 
+// ---- CedarC Decoder & Memory Adapter / IOMMU ABI ----
+
+enum EVIDEOCODECFORMAT {
+  VIDEO_CODEC_FORMAT_UNKNOWN = 0,
+  VIDEO_CODEC_FORMAT_MJPEG = 0x101,
+};
+
+enum EPIXELFORMAT {
+  PIXEL_FORMAT_DEFAULT = 0,
+  PIXEL_FORMAT_YUV_PLANER_420 = 1,
+  PIXEL_FORMAT_YUV_PLANER_422 = 2,
+  PIXEL_FORMAT_YUV_PLANER_444 = 3,
+  PIXEL_FORMAT_YV12 = 4,
+  PIXEL_FORMAT_NV21 = 5,
+  PIXEL_FORMAT_NV12 = 6,
+  PIXEL_FORMAT_YUYV = 14,
+  PIXEL_FORMAT_YVYU = 15,
+  PIXEL_FORMAT_UYVY = 16,
+  PIXEL_FORMAT_VYUY = 17,
+  PIXEL_FORMAT_PLANARUV_422 = 18,
+  PIXEL_FORMAT_PLANARVU_422 = 19,
+};
+
+enum EVDECODERESULT {
+  VDECODE_RESULT_UNSUPPORTED = -1,
+  VDECODE_RESULT_OK = 0,
+  VDECODE_RESULT_FRAME_DECODED = 1,
+  VDECODE_RESULT_CONTINUE = 2,
+  VDECODE_RESULT_KEYFRAME_DECODED = 3,
+  VDECODE_RESULT_NO_FRAME_BUFFER = 4,
+  VDECODE_RESULT_NO_BITSTREAM = 5,
+  VDECODE_RESULT_RESOLUTION_CHANGE = 6,
+};
+
+struct user_iommu_param {
+  int fd;
+  unsigned int iommu_addr;
+};
+
+struct ScMemOpsS {
+  int (*open)(void);
+  int (*open2)(void *, void *);
+  void (*close)(void);
+  int (*total_size)(void);
+  void *(*palloc)(int, void *, void *);
+  void *(*palloc_no_cache)(int, void *, void *);
+  void (*pfree)(void *, void *, void *);
+  void (*flush_cache)(void *, int);
+  void *(*ve_get_phyaddr)(void *);
+  void *(*ve_get_viraddr)(void *);
+  void *(*cpu_get_phyaddr)(void *);
+  void *(*cpu_get_viraddr)(void *);
+  int (*mem_set)(void *, int, size_t);
+  int (*mem_cpy)(void *, void *, size_t);
+  int (*mem_read)(void *, void *, size_t);
+  int (*mem_write)(void *, void *, size_t);
+  int (*setup)(void);
+  int (*shutdown)(void);
+  unsigned int (*get_ve_addr_offset)(void);
+  int (*get_debug_info)(char *, int);
+  int (*get_vir_by_fd)(int, void *);
+  int (*get_phy_by_fd)(int, void *);
+  int (*free_phy_by_fd)(int, unsigned long);
+  int (*get_fd_by_vir)(void *);
+};
+
+struct DecVcuConfig {
+  unsigned int bVcuAutoMode;
+  unsigned int nFrameNumInGroup;
+  unsigned int bEnableVcu;
+};
+
+struct VideoStreamInfo {
+  int eCodecFormat;
+  int nWidth;
+  int nHeight;
+  int nFrameRate;
+  int nFrameDuration;
+  int nAspectRatio;
+  int bIs3DStream;
+  int nCodecSpecificDataLen;
+  char *pCodecSpecificData;
+  int bSecureStreamFlag;
+  int bSecureStreamFlagLevel1;
+  int bIsFramePackage;
+  int h265ReferencePictureNum;
+  int bReOpenEngine;
+  int bIsFrameCtsTestFlag;
+  int bCheckInitFlag;
+};
+
+struct VConfig {
+  int bScaleDownEn;
+  int bRotationEn;
+  int bSecOutputEn;
+  int nHorizonScaleDownRatio;
+  int nVerticalScaleDownRatio;
+  int nSDWidth;
+  int nSDHeight;
+  int bAnySizeSD;
+  int nSecHorizonScaleDownRatio;
+  int nSecVerticalScaleDownRatio;
+  int nRotateDegree;
+  int bThumbnailMode;
+  int eOutputPixelFormat;
+  int eSecOutputPixelFormat;
+  int bNoBFrames;
+  int bDisable3D;
+  int bSupportMaf;
+  int bDispErrorFrame;
+  int nVbvBufferSize;
+  int nFrameBufferNum;
+  int bSecureosEn;
+  int bGpuBufValid;
+  int nAlignStride;
+  int bIsSoftDecoderFlag;
+  int bVirMallocSbm;
+  int bSupportPallocBufBeforeDecode;
+  int nDeInterlaceHoldingFrameBufferNum;
+  int nDisplayHoldingFrameBufferNum;
+  int nRotateHoldingFrameBufferNum;
+  int nDecodeSmoothFrameBufferNum;
+  int bIsTvStream;
+  int bAdapteDropFrame;
+  ScMemOpsS *memops;
+  int eCtlAfbcMode;
+  int nAfbcSecMode;
+  int eCtlIptvMode;
+  void *veOpsS;
+  void *pVeOpsSelf;
+  int bConvertVp910bitTo8bit;
+  unsigned int nVeFreq;
+  int bCalledByOmxFlag;
+  int bSetProcInfoEnable;
+  int nSetProcInfoFreq;
+  int nChannelNum;
+  int nSupportMaxWidth;
+  int nSupportMaxHeight;
+  int commonConfigFlag;
+  int bATMFlag;
+  DecVcuConfig sVcuConfig;
+};
+
+struct VideoStreamDataInfo {
+  char *pData;
+  int nLength;
+  int64_t nPts;
+  int64_t nPcr;
+  int bIsFirstPart;
+  int bIsLastPart;
+  int nID;
+  int nStreamIndex;
+  int bValid;
+  unsigned int bVideoInfoFlag;
+  void *pVideoInfo;
+};
+
+struct VideoFrmMvInfo {
+  int16_t nMaxMv_x;
+  int16_t nMinMv_x;
+  int16_t nAvgMv_x;
+  int16_t nMaxMv_y;
+  int16_t nMinMv_y;
+  int16_t nAvgMv_y;
+  int16_t nMaxMv;
+  int16_t nMinMv;
+  int16_t nAvgMv;
+  int16_t SkipRatio;
+};
+
+struct VideoFrmStatusInfo {
+  int enVidFrmType;
+  int nVidFrmSize;
+  int nVidFrmDisW;
+  int nVidFrmDisH;
+  int nVidFrmQP;
+  double nAverBitRate;
+  double nFrameRate;
+  int64_t nVidFrmPTS;
+  VideoFrmMvInfo nMvInfo;
+  int bDropPreFrame;
+};
+
+struct VideoPicture {
+  int nID;
+  int nStreamIndex;
+  int ePixelFormat;
+  int nWidth;
+  int nHeight;
+  int nLineStride;
+  int nTopOffset;
+  int nLeftOffset;
+  int nBottomOffset;
+  int nRightOffset;
+  int nFrameRate;
+  int nAspectRatio;
+  int bIsProgressive;
+  int bTopFieldFirst;
+  int bRepeatTopField;
+  int64_t nPts;
+  int64_t nPcr;
+  char *pData0;
+  char *pData1;
+  char *pData2;
+  char *pData3;
+  int bMafValid;
+  char *pMafData;
+  int nMafFlagStride;
+  int bPreFrmValid;
+  int nBufId;
+  uintptr_t phyYBufAddr;
+  uintptr_t phyCBufAddr;
+  void *pPrivate;
+  int nBufFd;
+  int nBufStatus;
+  int bTopFieldError;
+  int bBottomFieldError;
+  int nColorPrimary;
+  int bFrameErrorFlag;
+  void *pMetaData;
+  int video_full_range_flag;
+  int transfer_characteristics;
+  int matrix_coeffs;
+  uint8_t colour_primaries;
+  int nLower2BitBufSize;
+  int nLower2BitBufOffset;
+  int nLower2BitBufStride;
+  int b10BitPicFlag;
+  int bEnableAfbcFlag;
+  int nBufSize;
+  int nAfbcSize;
+  int nDebugCount;
+  VideoFrmStatusInfo nCurFrameInfo;
+};
+
+using VideoDecoder = void *;
+
 #if defined(__aarch64__)
 static_assert(sizeof(VencBaseConfig) == 80, "VencBaseConfig ABI mismatch");
 static_assert(offsetof(VencBaseConfig, nStride) == 20, "VencBaseConfig.nStride mismatch");
@@ -411,6 +648,36 @@ static_assert(offsetof(VencOutputBuffer, pData2) == 80, "VencOutputBuffer.pData2
 static_assert(sizeof(VencAllocateBufferParam) == 12, "VencAllocateBufferParam ABI mismatch");
 static_assert(sizeof(VencHeaderData) == 16, "VencHeaderData ABI mismatch");
 static_assert(sizeof(VencH264ConstraintFlag) == 1, "VencH264ConstraintFlag ABI mismatch");
+static_assert(sizeof(user_iommu_param) == 8, "user_iommu_param ABI mismatch");
+static_assert(sizeof(ScMemOpsS) == 192, "ScMemOpsS ABI mismatch");
+static_assert(offsetof(ScMemOpsS, close) == 16, "ScMemOpsS.close mismatch");
+static_assert(sizeof(VideoStreamInfo) == 72, "VideoStreamInfo ABI mismatch");
+static_assert(offsetof(VideoStreamInfo, pCodecSpecificData) == 32, "VideoStreamInfo.pCodecSpecificData mismatch");
+static_assert(offsetof(VideoStreamInfo, bIsFramePackage) == 48, "VideoStreamInfo.bIsFramePackage mismatch");
+static_assert(sizeof(VConfig) == 224, "VConfig ABI mismatch");
+static_assert(offsetof(VConfig, eOutputPixelFormat) == 48, "VConfig.eOutputPixelFormat mismatch");
+static_assert(offsetof(VConfig, nVbvBufferSize) == 72, "VConfig.nVbvBufferSize mismatch");
+static_assert(offsetof(VConfig, nAlignStride) == 88, "VConfig.nAlignStride mismatch");
+static_assert(offsetof(VConfig, nDisplayHoldingFrameBufferNum) == 108, "VConfig.nDisplayHoldingFrameBufferNum mismatch");
+static_assert(offsetof(VConfig, nDecodeSmoothFrameBufferNum) == 116, "VConfig.nDecodeSmoothFrameBufferNum mismatch");
+static_assert(offsetof(VConfig, memops) == 128, "VConfig.memops mismatch");
+static_assert(offsetof(VConfig, veOpsS) == 152, "VConfig.veOpsS mismatch");
+static_assert(offsetof(VConfig, sVcuConfig) == 208, "VConfig.sVcuConfig mismatch");
+static_assert(sizeof(VideoStreamDataInfo) == 64, "VideoStreamDataInfo ABI mismatch");
+static_assert(offsetof(VideoStreamDataInfo, nPts) == 16, "VideoStreamDataInfo.nPts mismatch");
+static_assert(offsetof(VideoStreamDataInfo, bIsFirstPart) == 32, "VideoStreamDataInfo.bIsFirstPart mismatch");
+static_assert(offsetof(VideoStreamDataInfo, bValid) == 48, "VideoStreamDataInfo.bValid mismatch");
+static_assert(offsetof(VideoStreamDataInfo, pVideoInfo) == 56, "VideoStreamDataInfo.pVideoInfo mismatch");
+static_assert(sizeof(VideoPicture) == 320, "VideoPicture ABI mismatch");
+static_assert(offsetof(VideoPicture, ePixelFormat) == 8, "VideoPicture.ePixelFormat mismatch");
+static_assert(offsetof(VideoPicture, nLineStride) == 20, "VideoPicture.nLineStride mismatch");
+static_assert(offsetof(VideoPicture, nPts) == 64, "VideoPicture.nPts mismatch");
+static_assert(offsetof(VideoPicture, pData0) == 80, "VideoPicture.pData0 mismatch");
+static_assert(offsetof(VideoPicture, pData1) == 88, "VideoPicture.pData1 mismatch");
+static_assert(offsetof(VideoPicture, phyYBufAddr) == 144, "VideoPicture.phyYBufAddr mismatch");
+static_assert(offsetof(VideoPicture, phyCBufAddr) == 152, "VideoPicture.phyCBufAddr mismatch");
+static_assert(offsetof(VideoPicture, nBufFd) == 168, "VideoPicture.nBufFd mismatch");
+static_assert(offsetof(VideoPicture, bFrameErrorFlag) == 188, "VideoPicture.bFrameErrorFlag mismatch");
 #endif
 
 } // namespace cedarc_abi

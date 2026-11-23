@@ -8,6 +8,11 @@ use crate::video::codec::vp8::{VP8Config, VP8Encoder};
 use crate::video::codec::vp9::{VP9Config, VP9Encoder};
 use crate::video::format::{PixelFormat, Resolution};
 use bytes::Bytes;
+#[cfg(target_os = "linux")]
+use hwcodec::cedarc_mjpeg::{
+    is_supported as cedarc_mjpeg_is_supported, last_error_message as cedarc_mjpeg_last_error,
+    CedarcMjpegCodec, CedarcMjpegConfig, CedarcMjpegH26x,
+};
 #[cfg(feature = "rkmpp")]
 use hwcodec::ffmpeg_hw::{
     last_error_message as ffmpeg_hw_last_error, HwMjpegH26xConfig, HwMjpegH26xPipeline,
@@ -21,20 +26,27 @@ use tracing::{info, warn};
 
 use super::shared::SharedVideoPipelineConfig;
 
-#[cfg(feature = "rkmpp")]
+#[cfg(any(feature = "rkmpp", target_os = "linux"))]
 pub(super) enum HwMjpegPipeline {
+    #[cfg(feature = "rkmpp")]
     Ffmpeg(HwMjpegH26xPipeline),
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "rkmpp"))]
     NativeMpp(NativeMppMjpegH264),
+    #[cfg(target_os = "linux")]
+    Cedarc(CedarcMjpegH26x),
 }
 
-#[cfg(feature = "rkmpp")]
+#[cfg(any(feature = "rkmpp", target_os = "linux"))]
 impl HwMjpegPipeline {
+    #[allow(dead_code)]
     pub(super) fn request_keyframe(&mut self) {
         match self {
+            #[cfg(feature = "rkmpp")]
             Self::Ffmpeg(p) => p.request_keyframe(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "rkmpp"))]
             Self::NativeMpp(_) => {}
+            #[cfg(target_os = "linux")]
+            Self::Cedarc(_) => {}
         }
     }
 
@@ -45,6 +57,7 @@ impl HwMjpegPipeline {
         force_idr: bool,
     ) -> std::result::Result<Option<(Vec<u8>, bool)>, String> {
         match self {
+            #[cfg(feature = "rkmpp")]
             Self::Ffmpeg(p) => {
                 if force_idr {
                     p.request_keyframe();
@@ -57,10 +70,18 @@ impl HwMjpegPipeline {
                     }
                 })
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "rkmpp"))]
             Self::NativeMpp(p) => p.encode(data, pts_ms, force_idr).map_err(|e| {
                 if e.is_empty() {
                     rkmpp_native_last_error()
+                } else {
+                    e
+                }
+            }),
+            #[cfg(target_os = "linux")]
+            Self::Cedarc(p) => p.encode(data, pts_ms, force_idr).map_err(|e| {
+                if e.is_empty() {
+                    cedarc_mjpeg_last_error()
                 } else {
                     e
                 }
@@ -70,6 +91,7 @@ impl HwMjpegPipeline {
 
     pub(super) fn reconfigure(&mut self, bitrate_kbps: i32, gop: i32) -> std::result::Result<(), String> {
         match self {
+            #[cfg(feature = "rkmpp")]
             Self::Ffmpeg(p) => p.reconfigure(bitrate_kbps, gop).map_err(|e| {
                 if e.is_empty() {
                     ffmpeg_hw_last_error()
@@ -77,12 +99,22 @@ impl HwMjpegPipeline {
                     e
                 }
             }),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", feature = "rkmpp"))]
             Self::NativeMpp(p) => p
                 .reconfigure(bitrate_kbps.max(1) as u32, gop.max(1) as u32)
                 .map_err(|e| {
                     if e.is_empty() {
                         rkmpp_native_last_error()
+                    } else {
+                        e
+                    }
+                }),
+            #[cfg(target_os = "linux")]
+            Self::Cedarc(p) => p
+                .reconfigure(bitrate_kbps.max(1) as u32, gop.max(1) as u32)
+                .map_err(|e| {
+                    if e.is_empty() {
+                        cedarc_mjpeg_last_error()
                     } else {
                         e
                     }
@@ -97,11 +129,11 @@ pub(super) struct EncoderThreadState {
     pub(super) nv12_converter: Option<Nv12Converter>,
     pub(super) yuv420p_converter: Option<PixelConverter>,
     pub(super) encoder_needs_yuv420p: bool,
-    #[cfg(feature = "rkmpp")]
+    #[cfg(any(feature = "rkmpp", target_os = "linux"))]
     pub(super) ffmpeg_hw_pipeline: Option<HwMjpegPipeline>,
-    #[cfg(feature = "rkmpp")]
+    #[cfg(any(feature = "rkmpp", target_os = "linux"))]
     pub(super) ffmpeg_hw_enabled: bool,
-    #[cfg(feature = "rkmpp")]
+    #[cfg(any(feature = "rkmpp", target_os = "linux"))]
     pub(super) hw_mjpeg_config: Option<SharedVideoPipelineConfig>,
     pub(super) fps: u32,
     pub(super) codec: VideoEncoderType,
@@ -457,11 +489,24 @@ pub(super) fn should_parallel_decode_mjpeg(config: &SharedVideoPipelineConfig) -
         None => registry.best_available_encoder(config.output_codec),
     };
     selected.is_some_and(|encoder| {
-        if matches!(
-            encoder.backend,
-            EncoderBackend::V4l2m2m | EncoderBackend::Cedarc
-        ) {
+        if encoder.backend == EncoderBackend::V4l2m2m {
             return true;
+        }
+        if encoder.backend == EncoderBackend::Cedarc {
+            #[cfg(target_os = "linux")]
+            {
+                let mode = std::env::var("ONE_KVM_CEDARC_MJPEG_MODE").unwrap_or_default();
+                if mode == "cpu" || mode == "libyuv" {
+                    return true;
+                }
+                // Pass raw MJPEG directly to the VE1+VE2 zero-copy pipeline when available;
+                // otherwise decode MJPEG in parallel on CPU threads.
+                return !cedarc_mjpeg_is_supported();
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return true;
+            }
         }
         if encoder.backend == EncoderBackend::Rkmpp {
             return match std::env::var("ONE_KVM_RKMPP_MODE").as_deref() {
@@ -670,6 +715,62 @@ pub(super) fn build_encoder_state(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    if needs_mjpeg_decode
+        && selected_codec_name.contains("cedarc")
+        && matches!(
+            config.output_codec,
+            VideoEncoderType::H264 | VideoEncoderType::H265
+        )
+    {
+        let cedarc_mode = std::env::var("ONE_KVM_CEDARC_MJPEG_MODE").unwrap_or_default();
+        if cedarc_mode != "cpu" && cedarc_mode != "libyuv" {
+            let codec = match config.output_codec {
+                VideoEncoderType::H265 => CedarcMjpegCodec::H265,
+                _ => CedarcMjpegCodec::H264,
+            };
+            match CedarcMjpegH26x::new(CedarcMjpegConfig {
+                codec,
+                width: config.resolution.width,
+                height: config.resolution.height,
+                fps: config.fps,
+                bitrate_kbps: config.bitrate_kbps(),
+                gop: config.gop_size().max(1),
+            }) {
+                Ok(pipeline) => {
+                    info!(
+                        "Using Allwinner VE zero-copy HW MJPEG->{} pipeline",
+                        config.output_codec
+                    );
+                    return Ok(EncoderThreadState {
+                        encoder: None,
+                        mjpeg_decoder: None,
+                        nv12_converter: None,
+                        yuv420p_converter: None,
+                        encoder_needs_yuv420p: false,
+                        ffmpeg_hw_pipeline: Some(HwMjpegPipeline::Cedarc(pipeline)),
+                        ffmpeg_hw_enabled: true,
+                        hw_mjpeg_config: Some(config.clone()),
+                        fps: config.fps,
+                        codec: config.output_codec,
+                        input_format: config.input_format,
+                    });
+                }
+                Err(e) => {
+                    let detail = if e.is_empty() {
+                        cedarc_mjpeg_last_error()
+                    } else {
+                        e
+                    };
+                    warn!(
+                        "Allwinner VE HW MJPEG->{} init failed ({}), falling back to CPU MJPEG decode",
+                        config.output_codec, detail
+                    );
+                }
+            }
+        }
+    }
+
     let (mjpeg_decoder, pipeline_input_format) = if needs_mjpeg_decode {
         let (decoder, format) = create_mjpeg_decoder(config.resolution)?;
         (Some(decoder), format)
@@ -849,11 +950,11 @@ pub(super) fn build_encoder_state(
         nv12_converter,
         yuv420p_converter,
         encoder_needs_yuv420p: needs_yuv420p,
-        #[cfg(feature = "rkmpp")]
+        #[cfg(any(feature = "rkmpp", target_os = "linux"))]
         ffmpeg_hw_pipeline: None,
-        #[cfg(feature = "rkmpp")]
+        #[cfg(any(feature = "rkmpp", target_os = "linux"))]
         ffmpeg_hw_enabled: false,
-        #[cfg(feature = "rkmpp")]
+        #[cfg(any(feature = "rkmpp", target_os = "linux"))]
         hw_mjpeg_config: None,
         fps: config.fps,
         codec: config.output_codec,
@@ -861,37 +962,70 @@ pub(super) fn build_encoder_state(
     })
 }
 
-#[cfg(feature = "rkmpp")]
+#[cfg(any(feature = "rkmpp", target_os = "linux"))]
+fn create_h265_encoder(
+    config: &SharedVideoPipelineConfig,
+    input_format: H265InputFormat,
+    codec_name: &str,
+) -> Result<Box<dyn VideoEncoderTrait + Send>> {
+    let encoder = H265Encoder::with_codec(
+        H265Config {
+            base: EncoderConfig {
+                resolution: config.resolution,
+                input_format: config.input_format,
+                quality: config.bitrate_kbps(),
+                fps: config.fps,
+                gop_size: config.gop_size(),
+            },
+            bitrate_kbps: config.bitrate_kbps(),
+            gop_size: config.gop_size(),
+            fps: config.fps,
+            input_format,
+        },
+        codec_name,
+    )?;
+    info!("Created H265 encoder: {}", encoder.codec_name());
+    Ok(Box::new(H265EncoderWrapper(encoder)))
+}
+
+#[cfg(any(feature = "rkmpp", target_os = "linux"))]
 pub(super) fn fallback_hw_mjpeg_pipeline(
     state: &mut EncoderThreadState,
     reason: &str,
 ) -> Result<()> {
     let Some(config) = state.hw_mjpeg_config.clone() else {
         return Err(AppError::VideoError(format!(
-            "FFmpeg HW encode failed (no fallback config): {}",
+            "HW MJPEG encode failed (no fallback config): {}",
             reason
         )));
     };
 
-    let was_ffmpeg = matches!(state.ffmpeg_hw_pipeline, Some(HwMjpegPipeline::Ffmpeg(_)));
     #[cfg(target_os = "linux")]
-    if was_ffmpeg
-        && config.output_codec == VideoEncoderType::H264
-        && std::env::var("ONE_KVM_RKMPP_MODE").as_deref() != Ok("ffmpeg")
+    let was_cedarc = matches!(state.ffmpeg_hw_pipeline, Some(HwMjpegPipeline::Cedarc(_)));
+    #[cfg(not(target_os = "linux"))]
+    let was_cedarc = false;
+
+    #[cfg(all(target_os = "linux", feature = "rkmpp"))]
     {
-        warn!(
-            "FFmpeg HW MJPEG->H264 runtime failed ({}), switching to Native MPP zero-copy pipeline",
-            reason
-        );
-        if let Ok(pipeline) = NativeMppMjpegH264::new(NativeMppConfig {
-            width: config.resolution.width,
-            height: config.resolution.height,
-            fps: config.fps,
-            bitrate_kbps: config.bitrate_kbps(),
-            gop: config.gop_size().max(1),
-        }) {
-            state.ffmpeg_hw_pipeline = Some(HwMjpegPipeline::NativeMpp(pipeline));
-            return Ok(());
+        let was_ffmpeg = matches!(state.ffmpeg_hw_pipeline, Some(HwMjpegPipeline::Ffmpeg(_)));
+        if was_ffmpeg
+            && config.output_codec == VideoEncoderType::H264
+            && std::env::var("ONE_KVM_RKMPP_MODE").as_deref() != Ok("ffmpeg")
+        {
+            warn!(
+                "FFmpeg HW MJPEG->H264 runtime failed ({}), switching to Native MPP zero-copy pipeline",
+                reason
+            );
+            if let Ok(pipeline) = NativeMppMjpegH264::new(NativeMppConfig {
+                width: config.resolution.width,
+                height: config.resolution.height,
+                fps: config.fps,
+                bitrate_kbps: config.bitrate_kbps(),
+                gop: config.gop_size().max(1),
+            }) {
+                state.ffmpeg_hw_pipeline = Some(HwMjpegPipeline::NativeMpp(pipeline));
+                return Ok(());
+            }
         }
     }
 
@@ -903,8 +1037,47 @@ pub(super) fn fallback_hw_mjpeg_pipeline(
     state.ffmpeg_hw_enabled = false;
 
     let (mjpeg_decoder, _) = create_mjpeg_decoder(config.resolution)?;
-    #[cfg(target_os = "linux")]
-    let encoder: Box<dyn VideoEncoderTrait + Send> =
+    let encoder: Box<dyn VideoEncoderTrait + Send> = if was_cedarc {
+        match config.output_codec {
+            VideoEncoderType::H264 => {
+                match create_h264_encoder(&config, H264InputFormat::Nv12, "h264_cedarc") {
+                    Ok(enc) => {
+                        info!("Fallback encoder active: {}", enc.codec_name());
+                        enc
+                    }
+                    Err(cedarc_err) => {
+                        warn!(
+                            "CedarC H264 fallback unavailable ({}), using libx264",
+                            cedarc_err
+                        );
+                        create_h264_encoder(&config, H264InputFormat::Yuv420p, "libx264")?
+                    }
+                }
+            }
+            VideoEncoderType::H265 => {
+                match create_h265_encoder(&config, H265InputFormat::Nv12, "hevc_cedarc") {
+                    Ok(enc) => {
+                        info!("Fallback encoder active: {}", enc.codec_name());
+                        enc
+                    }
+                    Err(cedarc_err) => {
+                        warn!(
+                            "CedarC H265 fallback unavailable ({}), using libx265",
+                            cedarc_err
+                        );
+                        create_h265_encoder(&config, H265InputFormat::Yuv420p, "libx265")?
+                    }
+                }
+            }
+            _ => {
+                return Err(AppError::VideoError(format!(
+                    "No fallback encoder for {}",
+                    config.output_codec
+                )));
+            }
+        }
+    } else {
+        #[cfg(all(target_os = "linux", feature = "rkmpp"))]
         if config.output_codec == VideoEncoderType::H264 {
             match NativeMppEncoderWrapper::new(&config, H264InputFormat::Nv12) {
                 Ok(native) => {
@@ -924,13 +1097,27 @@ pub(super) fn fallback_hw_mjpeg_pipeline(
                 "No fallback encoder for {}",
                 config.output_codec
             )));
-        };
+        }
 
-    #[cfg(not(target_os = "linux"))]
-    let encoder: Box<dyn VideoEncoderTrait + Send> =
-        create_h264_encoder(&config, H264InputFormat::Yuv420p, "libx264")?;
+        #[cfg(not(all(target_os = "linux", feature = "rkmpp")))]
+        match config.output_codec {
+            VideoEncoderType::H264 => {
+                create_h264_encoder(&config, H264InputFormat::Yuv420p, "libx264")?
+            }
+            VideoEncoderType::H265 => {
+                create_h265_encoder(&config, H265InputFormat::Yuv420p, "libx265")?
+            }
+            _ => {
+                return Err(AppError::VideoError(format!(
+                    "No fallback encoder for {}",
+                    config.output_codec
+                )));
+            }
+        }
+    };
 
-    let needs_yuv420p = encoder.codec_name().contains("libx264");
+    let needs_yuv420p =
+        encoder.codec_name().contains("libx264") || encoder.codec_name().contains("libx265");
     let (_, yuv420p_converter) = converters_for_pipeline(
         config.resolution,
         PixelFormat::Nv12,

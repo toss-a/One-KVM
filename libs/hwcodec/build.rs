@@ -399,6 +399,7 @@ mod ffmpeg {
         let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
         if target_os == "linux" {
             builder.file(ffmpeg_ram_dir.join("cedarc_encode.cpp"));
+            builder.file(ffmpeg_ram_dir.join("cedarc_mjpeg_h26x.cpp"));
         }
 
         // RKMPP decode only exists on ARM builds where FFmpeg is compiled with RKMPP support.

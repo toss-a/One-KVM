@@ -31,7 +31,7 @@ use super::delivery::{
     DeliveryStats, EncodedBatch, EncodedVideoFrameReceiver, FrameMailboxHandle,
     VideoFrameReservation, VideoSubscriber,
 };
-#[cfg(feature = "rkmpp")]
+#[cfg(any(feature = "rkmpp", target_os = "linux"))]
 use super::encoder_state::fallback_hw_mjpeg_pipeline;
 use super::encoder_state::{build_encoder_state, should_parallel_decode_mjpeg, EncoderThreadState};
 use super::frame_mailbox::{FrameMailbox, PublishResult};
@@ -726,7 +726,7 @@ impl SharedVideoPipeline {
         match cmd {
             PipelineCmd::SetBitrate { preset } => {
                 let bitrate_kbps = preset.bitrate_kbps();
-                #[cfg(feature = "rkmpp")]
+                #[cfg(any(feature = "rkmpp", target_os = "linux"))]
                 if state.ffmpeg_hw_enabled {
                     if let Some(ref mut cfg) = state.hw_mjpeg_config {
                         cfg.bitrate_preset = preset;
@@ -1821,11 +1821,11 @@ impl SharedVideoPipeline {
 
         let pts_ms = self.pts_ms();
 
-        #[cfg(feature = "rkmpp")]
+        #[cfg(any(feature = "rkmpp", target_os = "linux"))]
         if state.ffmpeg_hw_enabled {
-            if input_format != PixelFormat::Mjpeg {
+            if !input_format.is_compressed() {
                 return Err(AppError::VideoError(
-                    "FFmpeg HW pipeline requires MJPEG input".to_string(),
+                    "HW MJPEG pipeline requires MJPEG input".to_string(),
                 ));
             }
             let force_idr = self.keyframe_requested.swap(false, Ordering::AcqRel);
@@ -2556,11 +2556,11 @@ mod tests {
             nv12_converter: None,
             yuv420p_converter: None,
             encoder_needs_yuv420p: false,
-            #[cfg(feature = "rkmpp")]
+            #[cfg(any(feature = "rkmpp", target_os = "linux"))]
             ffmpeg_hw_pipeline: None,
-            #[cfg(feature = "rkmpp")]
+            #[cfg(any(feature = "rkmpp", target_os = "linux"))]
             ffmpeg_hw_enabled: false,
-            #[cfg(feature = "rkmpp")]
+            #[cfg(any(feature = "rkmpp", target_os = "linux"))]
             hw_mjpeg_config: None,
             fps: 30,
             codec: VideoEncoderType::H264,

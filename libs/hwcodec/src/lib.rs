@@ -1,5 +1,7 @@
 #[cfg(windows)]
 pub mod capture;
+#[cfg(target_os = "linux")]
+pub mod cedarc_mjpeg;
 pub mod common;
 pub mod ffmpeg;
 #[cfg(feature = "rkmpp")]
