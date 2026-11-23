@@ -70,6 +70,7 @@ mod dma_selection_tests {
             EncoderBackend::Nvenc,
             EncoderBackend::Qsv,
             EncoderBackend::Amf,
+            EncoderBackend::Cedarc,
             EncoderBackend::V4l2m2m,
         ] {
             for codec in [VideoEncoderType::H264, VideoEncoderType::H265] {

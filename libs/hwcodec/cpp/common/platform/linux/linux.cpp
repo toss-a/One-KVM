@@ -90,6 +90,14 @@ int setup_parent_death_signal() {
   }
 }
 
+// Check for Allwinner VE (CedarC) hardware encoder support
+// Returns 0 if supported, -1 otherwise
+extern "C" int cedarc_is_supported(void);
+
+int linux_support_cedarc() {
+  return cedarc_is_supported();
+}
+
 // Check for Rockchip MPP (Media Process Platform) support
 // Returns 0 if supported, -1 otherwise
 int linux_support_rkmpp() {

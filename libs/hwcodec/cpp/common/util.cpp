@@ -26,7 +26,7 @@ bool is_software_h264(const std::string &name) {
   if (name != "h264" && name != "libx264") return false;
   // Exclude all hardware encoders
   static const char* hw_suffixes[] = {
-    "nvenc", "amf", "qsv", "vaapi", "rkmpp",
+    "nvenc", "amf", "qsv", "vaapi", "rkmpp", "cedarc",
     "v4l2m2m", "videotoolbox", "_mf"
   };
   for (const auto& suffix : hw_suffixes) {
@@ -39,7 +39,7 @@ bool is_software_h264(const std::string &name) {
 bool is_software_hevc(const std::string &name) {
   if (name != "hevc" && name != "libx265") return false;
   static const char* hw_suffixes[] = {
-    "nvenc", "amf", "qsv", "vaapi", "rkmpp",
+    "nvenc", "amf", "qsv", "vaapi", "rkmpp", "cedarc",
     "v4l2m2m", "videotoolbox", "_mf"
   };
   for (const auto& suffix : hw_suffixes) {

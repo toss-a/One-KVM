@@ -94,6 +94,8 @@ pub enum EncoderBackend {
     Amf,
     /// Rockchip MPP
     Rkmpp,
+    /// Allwinner VE (CedarC)
+    Cedarc,
     /// V4L2 Memory-to-Memory (ARM)
     V4l2m2m,
     /// Software encoding (libx264, libx265, libvpx)
@@ -113,6 +115,8 @@ impl EncoderBackend {
             EncoderBackend::Amf
         } else if name.contains("rkmpp") {
             EncoderBackend::Rkmpp
+        } else if name.contains("cedarc") {
+            EncoderBackend::Cedarc
         } else if name.contains("v4l2m2m") {
             EncoderBackend::V4l2m2m
         } else {
@@ -133,6 +137,7 @@ impl EncoderBackend {
             EncoderBackend::Qsv => "QSV",
             EncoderBackend::Amf => "AMF",
             EncoderBackend::Rkmpp => "RKMPP",
+            EncoderBackend::Cedarc => "Allwinner VE",
             EncoderBackend::V4l2m2m => "V4L2 M2M",
             EncoderBackend::Software => "Software",
         }
@@ -147,6 +152,7 @@ impl EncoderBackend {
             "qsv" => Some(EncoderBackend::Qsv),
             "amf" => Some(EncoderBackend::Amf),
             "rkmpp" => Some(EncoderBackend::Rkmpp),
+            "cedarc" | "allwinner" | "allwinner_ve" | "sunxi" => Some(EncoderBackend::Cedarc),
             "v4l2m2m" | "v4l2" => Some(EncoderBackend::V4l2m2m),
             "software" | "cpu" => Some(EncoderBackend::Software),
             _ => None,
@@ -532,6 +538,14 @@ mod tests {
         assert_eq!(
             EncoderBackend::from_codec_name("h264_qsv"),
             EncoderBackend::Qsv
+        );
+        assert_eq!(
+            EncoderBackend::from_codec_name("h264_cedarc"),
+            EncoderBackend::Cedarc
+        );
+        assert_eq!(
+            EncoderBackend::from_codec_name("hevc_cedarc"),
+            EncoderBackend::Cedarc
         );
         assert_eq!(
             EncoderBackend::from_codec_name("libx264"),

@@ -163,6 +163,7 @@ export enum EncoderType {
 	Qsv = "qsv",
 	Amf = "amf",
 	Rkmpp = "rkmpp",
+	Cedarc = "cedarc",
 	V4l2m2m = "v4l2m2m",
 }
 

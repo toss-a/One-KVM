@@ -457,7 +457,10 @@ pub(super) fn should_parallel_decode_mjpeg(config: &SharedVideoPipelineConfig) -
         None => registry.best_available_encoder(config.output_codec),
     };
     selected.is_some_and(|encoder| {
-        if encoder.backend == EncoderBackend::V4l2m2m {
+        if matches!(
+            encoder.backend,
+            EncoderBackend::V4l2m2m | EncoderBackend::Cedarc
+        ) {
             return true;
         }
         if encoder.backend == EncoderBackend::Rkmpp {
@@ -787,6 +790,11 @@ pub(super) fn build_encoder_state(
                 | PixelFormat::Nv21
                 | PixelFormat::Nv24
         )
+    } else if codec_name.contains("cedarc") {
+        matches!(
+            pipeline_input_format,
+            PixelFormat::Nv12 | PixelFormat::Nv21 | PixelFormat::Yuyv | PixelFormat::Yuv420
+        )
     } else if codec_name.contains("libx264") {
         matches!(
             pipeline_input_format,
@@ -955,6 +963,14 @@ fn h264_direct_input_format(
             PixelFormat::Nv24 => Some(H264InputFormat::Nv24),
             _ => None,
         }
+    } else if codec_name.contains("cedarc") {
+        match input_format {
+            PixelFormat::Nv12 => Some(H264InputFormat::Nv12),
+            PixelFormat::Nv21 => Some(H264InputFormat::Nv21),
+            PixelFormat::Yuyv => Some(H264InputFormat::Yuyv422),
+            PixelFormat::Yuv420 => Some(H264InputFormat::Yuv420p),
+            _ => None,
+        }
     } else if codec_name.contains("libx264") {
         match input_format {
             PixelFormat::Nv12 => Some(H264InputFormat::Nv12),
@@ -982,6 +998,14 @@ fn h265_direct_input_format(
             PixelFormat::Nv16 => Some(H265InputFormat::Nv16),
             PixelFormat::Nv21 => Some(H265InputFormat::Nv21),
             PixelFormat::Nv24 => Some(H265InputFormat::Nv24),
+            _ => None,
+        }
+    } else if codec_name.contains("cedarc") {
+        match input_format {
+            PixelFormat::Nv12 => Some(H265InputFormat::Nv12),
+            PixelFormat::Nv21 => Some(H265InputFormat::Nv21),
+            PixelFormat::Yuyv => Some(H265InputFormat::Yuyv422),
+            PixelFormat::Yuv420 => Some(H265InputFormat::Yuv420p),
             _ => None,
         }
     } else if codec_name.contains("libx265") {

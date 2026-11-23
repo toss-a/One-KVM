@@ -102,6 +102,8 @@ pub enum EncoderType {
     Qsv,
     Amf,
     Rkmpp,
+    #[serde(alias = "allwinner", alias = "allwinner_ve", alias = "sunxi")]
+    Cedarc,
     #[serde(alias = "amlogic")]
     V4l2m2m,
 }
@@ -116,6 +118,7 @@ impl EncoderType {
             EncoderType::Qsv => "Intel Quick Sync",
             EncoderType::Amf => "AMD AMF",
             EncoderType::Rkmpp => "Rockchip MPP",
+            EncoderType::Cedarc => "Allwinner VE",
             EncoderType::V4l2m2m => "V4L2 M2M",
         }
     }

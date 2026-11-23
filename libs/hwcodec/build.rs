@@ -346,7 +346,7 @@ mod ffmpeg {
             .to_vec()
         } else if target_os == "linux" {
             // Base libraries for all Linux platforms
-            let mut v = vec!["drm", "stdc++"];
+            let mut v = vec!["drm", "stdc++", "dl"];
 
             // x86_64: needs X11 for VAAPI and zlib
             if target_arch == "x86_64" {
@@ -396,6 +396,10 @@ mod ffmpeg {
             .unwrap();
 
         builder.file(ffmpeg_ram_dir.join("ffmpeg_ram_encode.cpp"));
+        let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if target_os == "linux" {
+            builder.file(ffmpeg_ram_dir.join("cedarc_encode.cpp"));
+        }
 
         // RKMPP decode only exists on ARM builds where FFmpeg is compiled with RKMPP support.
         // Avoid compiling this file on x86/x64 where `AV_HWDEVICE_TYPE_RKMPP` doesn't exist.

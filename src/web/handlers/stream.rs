@@ -216,7 +216,7 @@ pub struct VideoCodecInfo {
 /// Encoder backend info
 #[derive(Serialize)]
 pub struct EncoderBackendInfo {
-    /// Backend identifier (vaapi, nvenc, qsv, amf, rkmpp, v4l2m2m, software)
+    /// Backend identifier (vaapi, nvenc, qsv, amf, rkmpp, cedarc, v4l2m2m, software)
     pub id: String,
     /// Display name
     pub name: String,

@@ -30,6 +30,7 @@ const PRIORITY_NVENC: i32 = 0;
 const PRIORITY_QSV: i32 = 1;
 const PRIORITY_AMF: i32 = 2;
 const PRIORITY_RKMPP: i32 = 3;
+const PRIORITY_CEDARC: i32 = 3;
 const PRIORITY_VAAPI: i32 = 4;
 const PRIORITY_V4L2M2M: i32 = 5;
 
@@ -81,6 +82,20 @@ fn linux_support_rkmpp() -> bool {
 
 #[cfg(not(target_os = "linux"))]
 fn linux_support_rkmpp() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_support_cedarc() -> bool {
+    extern "C" {
+        fn linux_support_cedarc() -> c_int;
+    }
+
+    unsafe { linux_support_cedarc() == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_support_cedarc() -> bool {
     false
 }
 
@@ -192,6 +207,25 @@ fn enumerate_candidate_codecs(ctx: &EncodeContext) -> Vec<CodecInfo> {
                 name: "hevc_rkmpp",
                 format: H265,
                 priority: PRIORITY_RKMPP,
+            },
+        );
+    }
+    if linux_support_cedarc() {
+        debug!("Allwinner VE (CedarC) hardware detected, adding CedarC encoders");
+        push_candidate(
+            &mut codecs,
+            CandidateCodecSpec {
+                name: "h264_cedarc",
+                format: H264,
+                priority: PRIORITY_CEDARC,
+            },
+        );
+        push_candidate(
+            &mut codecs,
+            CandidateCodecSpec {
+                name: "hevc_cedarc",
+                format: H265,
+                priority: PRIORITY_CEDARC,
             },
         );
     }

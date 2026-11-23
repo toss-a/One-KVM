@@ -13,6 +13,7 @@ pub fn encoder_type_to_backend(encoder: EncoderType) -> Option<EncoderBackend> {
         EncoderType::Qsv => Some(EncoderBackend::Qsv),
         EncoderType::Amf => Some(EncoderBackend::Amf),
         EncoderType::Rkmpp => Some(EncoderBackend::Rkmpp),
+        EncoderType::Cedarc => Some(EncoderBackend::Cedarc),
         EncoderType::V4l2m2m => Some(EncoderBackend::V4l2m2m),
     }
 }

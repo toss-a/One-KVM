@@ -15,6 +15,9 @@ extern "C" {
 
 #include "common.h"
 #include "owned_nv12_frame.h"
+#ifdef __linux__
+#include "cedarc_encode.h"
+#endif
 
 #define LOG_MODULE "FFMPEG_RAM_ENC"
 #include <log.h>
@@ -631,14 +634,38 @@ private:
   }
 };
 
+struct RamEncoderHandle {
+  FFmpegRamEncoder *ffmpeg = NULL;
+  void *cedarc = NULL;
+};
+
 } // namespace
 
-extern "C" FFmpegRamEncoder *
+extern "C" void *
 ffmpeg_ram_new_encoder(const char *name, int width,
                        int height, int pixfmt, int align, int fps, int gop,
                        int rc, int quality, int kbs, int q, int thread_count,
                        int gpu, int *linesize, int *offset, int *length,
                        RamEncodeCallback callback) {
+#ifdef __linux__
+  if (name && std::string(name).find("cedarc") != std::string::npos) {
+    g_encoder_last_error.clear();
+    void *cedarc = cedarc_new_encoder(
+        name, width, height, pixfmt, align, fps, gop, rc, kbs, linesize, offset,
+        length, reinterpret_cast<CedarcEncodeCallback>(callback));
+    if (!cedarc) {
+      const char *err = cedarc_encoder_last_error();
+      if (err && err[0] != '\0') {
+        set_encoder_last_error(err);
+      }
+      return NULL;
+    }
+    RamEncoderHandle *handle = new RamEncoderHandle();
+    handle->cedarc = cedarc;
+    return handle;
+  }
+#endif
+
   FFmpegRamEncoder *encoder = NULL;
   try {
     auto try_create = [&](int attempt_rc, int attempt_kbs) {
@@ -661,7 +688,9 @@ ffmpeg_ram_new_encoder(const char *name, int width,
     // AVBR, VBR or CBR with the driver.
     encoder = try_create(rc, kbs);
     if (encoder) {
-      return encoder;
+      RamEncoderHandle *handle = new RamEncoderHandle();
+      handle->ffmpeg = encoder;
+      return handle;
     }
 
     // Retry only VAAPI with a fresh context in explicit-QP mode. This avoids
@@ -673,7 +702,9 @@ ffmpeg_ram_new_encoder(const char *name, int width,
                 name + ", retrying with CQP");
       encoder = try_create(RC_CQ, 0);
       if (encoder) {
-        return encoder;
+        RamEncoderHandle *handle = new RamEncoderHandle();
+        handle->ffmpeg = encoder;
+        return handle;
       }
     }
   } catch (const std::exception &e) {
@@ -687,34 +718,68 @@ ffmpeg_ram_new_encoder(const char *name, int width,
   return NULL;
 }
 
-extern "C" int ffmpeg_ram_encode(FFmpegRamEncoder *encoder, const uint8_t *data,
+extern "C" int ffmpeg_ram_encode(void *encoder_ptr, const uint8_t *data,
                                  int length, const void *obj, uint64_t ms) {
+  RamEncoderHandle *handle = static_cast<RamEncoderHandle *>(encoder_ptr);
+  if (!handle) {
+    return -1;
+  }
+#ifdef __linux__
+  if (handle->cedarc) {
+    return cedarc_encode(handle->cedarc, data, length, obj,
+                         static_cast<int64_t>(ms));
+  }
+#endif
   try {
-    return encoder->encode(data, length, obj, ms);
+    return handle->ffmpeg->encode(data, length, obj, ms);
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("ffmpeg_ram_encode failed, ") + std::string(e.what()));
   }
   return -1;
 }
 
-extern "C" void ffmpeg_ram_free_encoder(FFmpegRamEncoder *encoder) {
+extern "C" void ffmpeg_ram_free_encoder(void *encoder_ptr) {
+  RamEncoderHandle *handle = static_cast<RamEncoderHandle *>(encoder_ptr);
+  if (!handle) {
+    return;
+  }
+#ifdef __linux__
+  if (handle->cedarc) {
+    cedarc_free_encoder(handle->cedarc);
+    handle->cedarc = NULL;
+    delete handle;
+    return;
+  }
+#endif
   try {
-    if (!encoder)
-      return;
-    encoder->free_encoder();
-    delete encoder;
-    encoder = NULL;
+    if (handle->ffmpeg) {
+      handle->ffmpeg->free_encoder();
+      delete handle->ffmpeg;
+      handle->ffmpeg = NULL;
+    }
+    delete handle;
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("free encoder failed, ") + std::string(e.what()));
   }
 }
 
-extern "C" int ffmpeg_ram_encode_packet(FFmpegRamEncoder *encoder,
+extern "C" int ffmpeg_ram_encode_packet(void *encoder_ptr,
                                         const uint8_t *data, int length,
                                         const void *obj, uint64_t ms,
                                         RamEncodePacketCallback callback) {
+  RamEncoderHandle *handle = static_cast<RamEncoderHandle *>(encoder_ptr);
+  if (!handle) {
+    return -1;
+  }
+#ifdef __linux__
+  if (handle->cedarc) {
+    return cedarc_encode_packet(
+        handle->cedarc, data, length, obj, static_cast<int64_t>(ms),
+        reinterpret_cast<CedarcEncodePacketCallback>(callback));
+  }
+#endif
   try {
-    return encoder->encode_packet(data, length, obj, ms, callback);
+    return handle->ffmpeg->encode_packet(data, length, obj, ms, callback);
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("encode_packet failed, ") + std::string(e.what()));
     return -1;
@@ -729,37 +794,57 @@ extern "C" void ffmpeg_ram_free_packet(void *packet) {
 }
 
 extern "C" int ffmpeg_ram_encode_owned_packet(
-    FFmpegRamEncoder *encoder, const uint8_t *data, int length, void *owner,
+    void *encoder_ptr, const uint8_t *data, int length, void *owner,
     RamInputRelease release, const void *obj, uint64_t ms,
     RamEncodePacketCallback callback) {
-  if (!encoder || !release) {
+  RamEncoderHandle *handle = static_cast<RamEncoderHandle *>(encoder_ptr);
+  if (!handle || !handle->ffmpeg || !release) {
     if (release)
       release(owner, const_cast<uint8_t *>(data));
     return AVERROR(EINVAL);
   }
   try {
-    return encoder->encode_owned_packet(data, length, owner, release, obj, ms,
-                                        callback);
+    return handle->ffmpeg->encode_owned_packet(data, length, owner, release,
+                                               obj, ms, callback);
   } catch (const std::exception &e) {
-    encoder->packet_callback_ = NULL;
+    handle->ffmpeg->packet_callback_ = NULL;
     LOG_ERROR(std::string("encode_owned_packet failed, ") + e.what());
     return -1;
   }
 }
 
-extern "C" int ffmpeg_ram_set_bitrate(FFmpegRamEncoder *encoder, int kbs) {
+extern "C" int ffmpeg_ram_set_bitrate(void *encoder_ptr, int kbs) {
+  RamEncoderHandle *handle = static_cast<RamEncoderHandle *>(encoder_ptr);
+  if (!handle) {
+    return -1;
+  }
+#ifdef __linux__
+  if (handle->cedarc) {
+    return cedarc_set_bitrate(handle->cedarc, kbs);
+  }
+#endif
   try {
-    return encoder->set_bitrate(kbs);
+    return handle->ffmpeg->set_bitrate(kbs);
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("ffmpeg_ram_set_bitrate failed, ") + std::string(e.what()));
   }
   return -1;
 }
 
-extern "C" void ffmpeg_ram_request_keyframe(FFmpegRamEncoder *encoder) {
+extern "C" void ffmpeg_ram_request_keyframe(void *encoder_ptr) {
+  RamEncoderHandle *handle = static_cast<RamEncoderHandle *>(encoder_ptr);
+  if (!handle) {
+    return;
+  }
+#ifdef __linux__
+  if (handle->cedarc) {
+    cedarc_request_keyframe(handle->cedarc);
+    return;
+  }
+#endif
   try {
-    if (encoder) {
-      encoder->request_keyframe();
+    if (handle->ffmpeg) {
+      handle->ffmpeg->request_keyframe();
     }
   } catch (const std::exception &e) {
     LOG_ERROR(std::string("ffmpeg_ram_request_keyframe failed, ") + std::string(e.what()));

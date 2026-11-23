@@ -46,6 +46,8 @@ pub enum H264EncoderType {
     Vaapi,
     /// RKMPP (Rockchip) - requires hwcodec extension
     Rkmpp,
+    /// Allwinner VE (CedarC)
+    Cedarc,
     /// V4L2 M2M (ARM generic) - requires hwcodec extension
     V4l2M2m,
     /// Software encoding (libx264/openh264)
@@ -63,6 +65,7 @@ impl std::fmt::Display for H264EncoderType {
             H264EncoderType::Amf => write!(f, "AMF"),
             H264EncoderType::Vaapi => write!(f, "VAAPI"),
             H264EncoderType::Rkmpp => write!(f, "RKMPP"),
+            H264EncoderType::Cedarc => write!(f, "Allwinner VE"),
             H264EncoderType::V4l2M2m => write!(f, "V4L2 M2M"),
             H264EncoderType::Software => write!(f, "Software"),
             H264EncoderType::None => write!(f, "None"),
@@ -79,6 +82,7 @@ impl From<EncoderBackend> for H264EncoderType {
             EncoderBackend::Amf => H264EncoderType::Amf,
             EncoderBackend::Vaapi => H264EncoderType::Vaapi,
             EncoderBackend::Rkmpp => H264EncoderType::Rkmpp,
+            EncoderBackend::Cedarc => H264EncoderType::Cedarc,
             EncoderBackend::V4l2m2m => H264EncoderType::V4l2M2m,
             EncoderBackend::Software => H264EncoderType::Software,
         }

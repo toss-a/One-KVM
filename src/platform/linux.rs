@@ -8,7 +8,7 @@ pub fn capabilities() -> PlatformCapabilities {
         mode_label: PlatformMode::Linux.label(),
         video_capture: FeatureCapability::available(["v4l2"]),
         encoder: FeatureCapability::available([
-            "software", "vaapi", "nvenc", "qsv", "amf", "rkmpp", "v4l2m2m",
+            "software", "vaapi", "nvenc", "qsv", "amf", "rkmpp", "cedarc", "v4l2m2m",
         ]),
         hid: FeatureCapability::available(["otg", "ch9329", "ch9329_otg", "bluetooth", "none"]),
         atx: FeatureCapability::available(["gpio", "usb_relay", "serial", "wol", "none"]),

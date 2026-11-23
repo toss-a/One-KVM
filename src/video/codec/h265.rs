@@ -43,6 +43,8 @@ pub enum H265EncoderType {
     Vaapi,
     /// RKMPP (Rockchip)
     Rkmpp,
+    /// Allwinner VE (CedarC)
+    Cedarc,
     /// V4L2 M2M (ARM generic)
     V4l2M2m,
     /// Software encoder (libx265)
@@ -60,6 +62,7 @@ impl std::fmt::Display for H265EncoderType {
             H265EncoderType::Amf => write!(f, "AMF"),
             H265EncoderType::Vaapi => write!(f, "VAAPI"),
             H265EncoderType::Rkmpp => write!(f, "RKMPP"),
+            H265EncoderType::Cedarc => write!(f, "Allwinner VE"),
             H265EncoderType::V4l2M2m => write!(f, "V4L2 M2M"),
             H265EncoderType::Software => write!(f, "Software"),
             H265EncoderType::None => write!(f, "None"),
@@ -75,6 +78,7 @@ impl From<EncoderBackend> for H265EncoderType {
             EncoderBackend::Amf => H265EncoderType::Amf,
             EncoderBackend::Vaapi => H265EncoderType::Vaapi,
             EncoderBackend::Rkmpp => H265EncoderType::Rkmpp,
+            EncoderBackend::Cedarc => H265EncoderType::Cedarc,
             EncoderBackend::V4l2m2m => H265EncoderType::V4l2M2m,
             EncoderBackend::Software => H265EncoderType::Software,
         }
