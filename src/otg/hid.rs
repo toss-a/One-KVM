@@ -61,6 +61,10 @@ impl HidFunctionType {
             HidFunctionType::ConsumerControl => CONSUMER_CONTROL,
         }
     }
+
+    pub fn needs_out_endpoint(&self, keyboard_leds: bool) -> bool {
+        matches!(self, HidFunctionType::Keyboard) && keyboard_leds
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +148,17 @@ impl GadgetFunction for HidFunction {
             self.func_type.report_desc(self.keyboard_leds),
         )?;
 
+        // Linux 6.2+ f_hid exposes `no_out_endpoint` so HID functions without
+        // Output reports do not consume an Interrupt OUT endpoint on
+        // endpoint-constrained UDCs (e.g. Allwinner sunxi_udc). Older kernels
+        // simply do not expose this ConfigFS attribute.
+        let no_out_endpoint = if self.func_type.needs_out_endpoint(self.keyboard_leds) {
+            "0"
+        } else {
+            "1"
+        };
+        let _ = write_file_if_exists(&func_path.join("no_out_endpoint"), no_out_endpoint)?;
+
         // Supported by the PiKVM HID kernel patch. Older kernels simply do
         // not expose this ConfigFS attribute.
         let _ = write_file_if_exists(&func_path.join("wakeup_on_write"), "1")?;
@@ -203,5 +218,56 @@ mod tests {
 
         let mouse = HidFunction::mouse_relative(1);
         assert_eq!(mouse.name(), "hid.usb1");
+    }
+
+    #[test]
+    fn test_hid_out_endpoint_requirements() {
+        assert!(!HidFunctionType::Keyboard.needs_out_endpoint(false));
+        assert!(HidFunctionType::Keyboard.needs_out_endpoint(true));
+        assert!(!HidFunctionType::MouseRelative.needs_out_endpoint(true));
+        assert!(!HidFunctionType::MouseAbsolute.needs_out_endpoint(true));
+        assert!(!HidFunctionType::ConsumerControl.needs_out_endpoint(true));
+    }
+
+    #[test]
+    fn test_hid_create_sets_no_out_endpoint_when_supported() {
+        let cases = [
+            (HidFunction::keyboard(0, false), "1"),
+            (HidFunction::keyboard(1, true), "0"),
+            (HidFunction::mouse_relative(2), "1"),
+            (HidFunction::mouse_absolute(3), "1"),
+            (HidFunction::consumer_control(4), "1"),
+        ];
+
+        for (func, expected) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let func_path = temp.path().join("functions").join(func.name());
+            std::fs::create_dir_all(&func_path).unwrap();
+            std::fs::write(func_path.join("no_out_endpoint"), b"0\n").unwrap();
+
+            func.create(temp.path()).unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(func_path.join("no_out_endpoint"))
+                    .unwrap()
+                    .trim(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_hid_create_ignores_missing_no_out_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let func = HidFunction::mouse_absolute(0);
+
+        func.create(temp.path()).unwrap();
+
+        assert!(!temp
+            .path()
+            .join("functions")
+            .join(func.name())
+            .join("no_out_endpoint")
+            .exists());
     }
 }

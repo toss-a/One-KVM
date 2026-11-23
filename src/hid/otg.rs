@@ -80,6 +80,7 @@ pub struct OtgBackend {
     keyboard_leds_enabled: bool,
     keyboard_state: Mutex<KeyboardReport>,
     mouse_buttons: AtomicU8,
+    mouse_abs_position: Mutex<(u16, u16)>,
     macos_drag: bool,
     macos_drag_state: Mutex<super::macos_drag::MacosDrag>,
     led_state: Arc<parking_lot::RwLock<LedState>>,
@@ -123,6 +124,7 @@ impl OtgBackend {
             keyboard_leds_enabled: paths.keyboard_leds_enabled,
             keyboard_state: Mutex::new(KeyboardReport::default()),
             mouse_buttons: AtomicU8::new(0),
+            mouse_abs_position: Mutex::new((0, 0)),
             macos_drag,
             macos_drag_state: Mutex::new(super::macos_drag::MacosDrag::default()),
             led_state: Arc::new(parking_lot::RwLock::new(LedState::default())),
@@ -461,6 +463,10 @@ impl OtgBackend {
                 error_code: "not_opened".to_string(),
             })
         }
+    }
+
+    fn uses_absolute_only_mouse(&self) -> bool {
+        self.mouse_rel_path.is_none() && self.mouse_abs_path.is_some()
     }
 
     fn send_mouse_report_absolute(&self, buttons: u8, x: u16, y: u16, wheel: i8) -> Result<()> {
@@ -887,6 +893,8 @@ impl HidBackend for OtgBackend {
             return Ok(());
         }
 
+        let abs_only = self.uses_absolute_only_mouse();
+
         match event.event_type {
             MouseEventType::Move => {
                 let dx = event.x.clamp(-127, 127) as i8;
@@ -894,27 +902,46 @@ impl HidBackend for OtgBackend {
                 self.send_mouse_report_relative(buttons, dx, dy, 0)?;
             }
             MouseEventType::MoveAbs => {
-                // Coordinates 0–32767; buttons are sent only on the relative endpoint.
+                // Coordinates 0–32767. When both mouse interfaces exist, buttons are
+                // sent only on the relative endpoint; when only the absolute interface
+                // is enabled, include button state so clicks and dragging still work.
                 let x = event.x.clamp(0, 32767) as u16;
                 let y = event.y.clamp(0, 32767) as u16;
-                self.send_mouse_report_absolute(0, x, y, 0)?;
+                *self.mouse_abs_position.lock() = (x, y);
+                let report_buttons = if abs_only { buttons } else { 0 };
+                self.send_mouse_report_absolute(report_buttons, x, y, 0)?;
             }
             MouseEventType::Down => {
                 if let Some(button) = event.button {
                     let bit = button.to_hid_bit();
                     let new_buttons = self.mouse_buttons.fetch_or(bit, Ordering::Relaxed) | bit;
-                    self.send_mouse_report_relative(new_buttons, 0, 0, 0)?;
+                    if abs_only {
+                        let (x, y) = *self.mouse_abs_position.lock();
+                        self.send_mouse_report_absolute(new_buttons, x, y, 0)?;
+                    } else {
+                        self.send_mouse_report_relative(new_buttons, 0, 0, 0)?;
+                    }
                 }
             }
             MouseEventType::Up => {
                 if let Some(button) = event.button {
                     let bit = button.to_hid_bit();
                     let new_buttons = self.mouse_buttons.fetch_and(!bit, Ordering::Relaxed) & !bit;
-                    self.send_mouse_report_relative(new_buttons, 0, 0, 0)?;
+                    if abs_only {
+                        let (x, y) = *self.mouse_abs_position.lock();
+                        self.send_mouse_report_absolute(new_buttons, x, y, 0)?;
+                    } else {
+                        self.send_mouse_report_relative(new_buttons, 0, 0, 0)?;
+                    }
                 }
             }
             MouseEventType::Scroll => {
-                self.send_mouse_report_relative(buttons, 0, 0, event.scroll)?;
+                if abs_only {
+                    let (x, y) = *self.mouse_abs_position.lock();
+                    self.send_mouse_report_absolute(buttons, x, y, event.scroll)?;
+                } else {
+                    self.send_mouse_report_relative(buttons, 0, 0, event.scroll)?;
+                }
             }
         }
 
@@ -931,6 +958,7 @@ impl HidBackend for OtgBackend {
         }
 
         self.mouse_buttons.store(0, Ordering::Relaxed);
+        *self.mouse_abs_position.lock() = (0, 0);
         self.macos_drag_state.lock().reset();
         self.send_mouse_report_relative(0, 0, 0, 0)?;
         self.send_mouse_report_absolute(0, 0, 0, 0)?;
@@ -1067,6 +1095,53 @@ mod tests {
     #[test]
     fn compatibility_requires_both_mouse_endpoints() {
         assert!(OtgBackend::with_macos_drag(HidDevicePaths::default(), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn absolute_only_mouse_sends_buttons_drag_and_scroll_with_last_position() {
+        use crate::hid::MouseButton;
+        let absolute = tempfile::NamedTempFile::new().unwrap();
+        let backend = OtgBackend::from_handles(HidDevicePaths {
+            mouse_absolute: Some(absolute.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        for event in [
+            MouseEvent::move_abs(8000, 12000),
+            MouseEvent::button_down(MouseButton::Left),
+            MouseEvent::move_abs(16000, 20000),
+            MouseEvent::scroll(-3),
+            MouseEvent::button_up(MouseButton::Left),
+        ] {
+            backend.send_mouse(event).await.unwrap();
+        }
+
+        let packets: Vec<[u8; 6]> = fs::read(absolute.path())
+            .unwrap()
+            .chunks_exact(6)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect();
+        let encode = |buttons: u8, x: u16, y: u16, wheel: i8| {
+            [
+                buttons,
+                (x & 0xFF) as u8,
+                (x >> 8) as u8,
+                (y & 0xFF) as u8,
+                (y >> 8) as u8,
+                wheel as u8,
+            ]
+        };
+        assert_eq!(
+            packets,
+            vec![
+                encode(0, 8000, 12000, 0),
+                encode(1, 8000, 12000, 0),
+                encode(1, 16000, 20000, 0),
+                encode(1, 16000, 20000, -3),
+                encode(0, 16000, 20000, 0),
+            ]
+        );
     }
 
     #[tokio::test]
