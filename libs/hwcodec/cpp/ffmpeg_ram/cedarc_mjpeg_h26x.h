@@ -17,7 +17,9 @@ void *cedarc_mjpeg_h26x_new(int codec, int width, int height, int fps,
                             int kbps, int gop);
 
 // Decode MJPEG on VE1 -> zero-copy DMA-buf/IOMMU -> encode H.264/H.265 on VE2.
-// Returns 0 on success (*out_size == 0 means frame skipped without fatal error),
+// Runs VE1 decode and VE2 encode 1-frame overlapped; passing jpeg_data == NULL
+// and jpeg_len == 0 flushes any pending pipelined packet without submitting input.
+// Returns 0 on success (*out_size == 0 means no packet emitted on this call),
 // or -1 on fatal pipeline error (caller should fall back to CPU MJPEG decode).
 int cedarc_mjpeg_h26x_encode(void *pipeline, const uint8_t *jpeg_data,
                              size_t jpeg_len, int64_t pts_us, int force_idr,

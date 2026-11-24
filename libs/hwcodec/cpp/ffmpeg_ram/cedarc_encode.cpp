@@ -270,7 +270,10 @@ public:
     g_api.VideoEncSetParameter(enc_, VENC_IndexParamSetVbvSize, &vbv_size);
 
     const int bitrate_bps = std::max(kbs_, 64) * 1000;
-    const VENC_RC_MODE rc_mode = (rc_ == RC_CBR) ? AW_CBR : AW_VBR;
+    // VE2 AW_VBR pins static KVM screens to nMaxqp (crushing bitrate and
+    // blurring text), and tuned VBR thresholds can stall VE2 hardware; use
+    // AW_CBR (matching Allwinner vencoderdemo) with tighter QP bounds instead.
+    const VENC_RC_MODE rc_mode = AW_CBR;
 
     if (codec_type_ == VENC_CODEC_H264) {
       VencH264Param h264;
@@ -287,19 +290,17 @@ public:
       h264.sProfileLevel.nProfile = VENC_H264ProfileHigh;
       h264.sProfileLevel.nLevel = (width_ >= 2560 || height_ >= 1440)
                                       ? VENC_H264Level51
-                                      : VENC_H264Level41;
-      h264.sQPRange.nMinqp = 15;
-      h264.sQPRange.nMaxqp = 45;
-      h264.sQPRange.nMinPqp = 15;
-      h264.sQPRange.nMaxPqp = 45;
-      h264.sQPRange.nQpInit = 28;
+                                      : (fps_ > 30 || width_ >= 1920)
+                                            ? VENC_H264Level42
+                                            : VENC_H264Level41;
+      h264.sQPRange.nMinqp = 10;
+      h264.sQPRange.nMaxqp = 38;
+      h264.sQPRange.nMinPqp = 10;
+      h264.sQPRange.nMaxPqp = 38;
+      h264.sQPRange.nQpInit = 24;
       h264.sGopParam.bUseGopCtrlEn = 1;
       h264.sGopParam.eGopMode = AW_NORMALP;
       h264.sRcParam.eRcMode = rc_mode;
-      h264.sRcParam.sVbrParam.uMaxBitRate =
-          static_cast<unsigned int>(bitrate_bps) * 2u;
-      h264.sRcParam.sVbrParam.nMovingTh = 20;
-      h264.sRcParam.sVbrParam.nQuality = 10;
 
       int ret = g_api.VideoEncSetParameter(enc_, VENC_IndexParamH264Param,
                                            &h264);
@@ -317,23 +318,19 @@ public:
       h265.nGopSize = gop_;
       h265.nIntraPeriod = gop_;
       h265.idr_period = gop_;
-      h265.nQPInit = 28;
+      h265.nQPInit = 24;
       h265.sProfileLevel.nProfile = VENC_H265ProfileMain;
       h265.sProfileLevel.nLevel = (width_ >= 2560 || height_ >= 1440)
                                       ? VENC_H265Level51
                                       : VENC_H265Level41;
-      h265.sQPRange.nMinqp = 15;
-      h265.sQPRange.nMaxqp = 45;
-      h265.sQPRange.nMinPqp = 15;
-      h265.sQPRange.nMaxPqp = 45;
-      h265.sQPRange.nQpInit = 28;
+      h265.sQPRange.nMinqp = 10;
+      h265.sQPRange.nMaxqp = 38;
+      h265.sQPRange.nMinPqp = 10;
+      h265.sQPRange.nMaxPqp = 38;
+      h265.sQPRange.nQpInit = 24;
       h265.sGopParam.bUseGopCtrlEn = 1;
       h265.sGopParam.eGopMode = AW_NORMALP;
       h265.sRcParam.eRcMode = rc_mode;
-      h265.sRcParam.sVbrParam.uMaxBitRate =
-          static_cast<unsigned int>(bitrate_bps) * 2u;
-      h265.sRcParam.sVbrParam.nMovingTh = 20;
-      h265.sRcParam.sVbrParam.nQuality = 10;
 
       int ret = g_api.VideoEncSetParameter(enc_, VENC_IndexParamH265Param,
                                            &h265);

@@ -2,12 +2,15 @@
 #include "cedarc_abi.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <dlfcn.h>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #define LOG_MODULE "CEDARC_MJPEG"
@@ -376,6 +379,28 @@ public:
   std::vector<uint8_t> jpeg_patch_buf_;
   std::vector<uint8_t> out_buf_;
 
+  std::unordered_map<int, user_iommu_param> iommu_cache_;
+
+  std::mutex mtx_;
+  std::condition_variable cv_;
+  std::thread enc_thread_;
+  bool worker_stop_ = false;
+  bool job_pending_ = false;
+  bool job_running_ = false;
+  bool result_ready_ = false;
+
+  VideoPicture *job_pic_ = nullptr;
+  int64_t job_pts_us_ = 0;
+  int job_force_idr_ = 0;
+  VENC_PIXEL_FMT job_fmt_ = VENC_PIXEL_YUV420SP;
+  int job_stride_ = 0;
+
+  VideoPicture *done_pic_ = nullptr;
+  int done_ret_ = 0;
+  std::string done_error_;
+  std::vector<uint8_t> worker_out_buf_;
+  int done_keyframe_ = 0;
+
   CedarcMjpegH26xPipeline(int codec, int width, int height, int fps, int kbps,
                           int gop)
       : codec_type_(codec == 1 ? VENC_CODEC_H265 : VENC_CODEC_H264),
@@ -421,7 +446,8 @@ public:
     std::memset(&vcfg, 0, sizeof(vcfg));
     vcfg.eOutputPixelFormat = PIXEL_FORMAT_NV12;
     vcfg.nDeInterlaceHoldingFrameBufferNum = 0;
-    vcfg.nDisplayHoldingFrameBufferNum = 1;
+    // Hold 3 display buffers so VE1 can decode frame N while VE2 encodes N-1.
+    vcfg.nDisplayHoldingFrameBufferNum = 3;
     vcfg.nRotateHoldingFrameBufferNum = 0;
     vcfg.nDecodeSmoothFrameBufferNum = 1;
     vcfg.nVbvBufferSize = dec_vbv_size_;
@@ -449,6 +475,7 @@ public:
       return false;
     }
 
+    enc_thread_ = std::thread(&CedarcMjpegH26xPipeline::enc_worker_loop, this);
     return true;
   }
 
@@ -459,6 +486,9 @@ public:
     if (gop > 0) {
       gop_ = gop;
     }
+
+    std::unique_lock<std::mutex> lk(mtx_);
+    cv_.wait(lk, [this]() { return !job_pending_ && !job_running_; });
     if (!enc_) {
       return 0;
     }
@@ -491,10 +521,30 @@ public:
       return -1;
     }
 
+    if (jpeg_data == nullptr && jpeg_len == 0) {
+      bool prev_err = false;
+      std::string err_msg;
+      collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
+                              &err_msg);
+      if (prev_err) {
+        set_last_error(err_msg);
+        return -1;
+      }
+      return 0;
+    }
+
     const uint8_t *submit_ptr = nullptr;
     size_t submit_len = 0;
     if (!prepare_jpeg_with_dht(jpeg_data, jpeg_len, jpeg_patch_buf_,
                                &submit_ptr, &submit_len)) {
+      bool prev_err = false;
+      std::string err_msg;
+      collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
+                              &err_msg);
+      if (prev_err) {
+        set_last_error(err_msg);
+        return -1;
+      }
       // Malformed / non-SOI packet from UVC capture; skip without killing HW.
       return 0;
     }
@@ -505,7 +555,7 @@ public:
       return -1;
     }
 
-    // 1. Submit JPEG bitstream to VE1
+    // 1. Submit JPEG bitstream to VE1 (runs while VE2 worker encodes N-1).
     char *buf = nullptr;
     char *ring = nullptr;
     int buf_sz = 0;
@@ -550,7 +600,11 @@ public:
       return -1;
     }
 
-    // 2. Hardware MJPEG decode on VE1
+    // 2. Hardware MJPEG decode on VE1 in parallel with VE2 encoding N-1.
+    bool prev_collected = false;
+    bool prev_err = false;
+    std::string prev_err_msg;
+
     VideoPicture *pic = nullptr;
     int last_dret = VDECODE_RESULT_OK;
     for (int attempt = 0; attempt < 4; ++attempt) {
@@ -559,15 +613,33 @@ public:
       if (pic) {
         break;
       }
-      if (last_dret == VDECODE_RESULT_UNSUPPORTED) {
-        break;
+      if (last_dret == VDECODE_RESULT_NO_FRAME_BUFFER && !prev_collected) {
+        // Wait for VE2 and return N-1 picture to VE1 FBM, then retry decode.
+        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
+                                &prev_err_msg);
+        prev_collected = true;
+        if (prev_err) {
+          set_last_error(prev_err_msg);
+          return -1;
+        }
+        continue;
       }
-      if (last_dret == VDECODE_RESULT_NO_BITSTREAM) {
+      if (last_dret == VDECODE_RESULT_UNSUPPORTED ||
+          last_dret == VDECODE_RESULT_NO_BITSTREAM) {
         break;
       }
     }
 
     if (!pic) {
+      if (!prev_collected) {
+        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
+                                &prev_err_msg);
+        prev_collected = true;
+        if (prev_err) {
+          set_last_error(prev_err_msg);
+          return -1;
+        }
+      }
       ++consecutive_decode_misses_;
       if (last_dret == VDECODE_RESULT_UNSUPPORTED ||
           consecutive_decode_misses_ >= 5) {
@@ -581,65 +653,171 @@ public:
     }
     consecutive_decode_misses_ = 0;
 
-    // Guarantee VE1 FBM buffer is always returned on every exit path.
-    struct PictureGuard {
-      VideoDecoder *dec;
-      VideoPicture *pic;
-      ~PictureGuard() {
-        if (dec && pic) {
-          g_api.ReturnPicture(dec, pic);
+    if (pic->bFrameErrorFlag != 0) {
+      g_api.ReturnPicture(dec_, pic);
+      if (!prev_collected) {
+        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
+                                &prev_err_msg);
+        if (prev_err) {
+          set_last_error(prev_err_msg);
+          return -1;
         }
       }
-    } pic_guard{dec_, pic};
-
-    if (pic->bFrameErrorFlag != 0) {
       return 0;
     }
 
     VENC_PIXEL_FMT decoded_venc_fmt = VENC_PIXEL_YUV420SP;
     if (!map_decoder_pixfmt_to_venc(pic->ePixelFormat, &decoded_venc_fmt)) {
+      const int bad_fmt = pic->ePixelFormat;
+      g_api.ReturnPicture(dec_, pic);
+      if (!prev_collected) {
+        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
+                                &prev_err_msg);
+      }
       set_last_error("Unsupported VE1 decoded pixel format for VE2: " +
-                     std::to_string(pic->ePixelFormat));
+                     std::to_string(bad_fmt));
+      return -1;
+    }
+
+    if (pic->nBufFd <= 0) {
+      g_api.ReturnPicture(dec_, pic);
+      if (!prev_collected) {
+        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
+                                &prev_err_msg);
+      }
+      set_last_error("CedarC VE1 decoded picture has no DMA-buf fd");
       return -1;
     }
 
     const int pic_stride =
         (pic->nLineStride > 0) ? pic->nLineStride : align16(width_);
+
+    // 3. Collect frame N-1 result and return its VE1 picture before dispatching N.
+    if (!prev_collected) {
+      collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
+                              &prev_err_msg);
+      if (prev_err) {
+        g_api.ReturnPicture(dec_, pic);
+        set_last_error(prev_err_msg);
+        return -1;
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      job_pic_ = pic;
+      job_pts_us_ = pts_us;
+      job_force_idr_ = force_idr;
+      job_fmt_ = decoded_venc_fmt;
+      job_stride_ = pic_stride;
+      job_pending_ = true;
+    }
+    cv_.notify_one();
+    return 0;
+  }
+
+private:
+  bool map_dmabuf_iommu(int fd, unsigned int *out_addr) {
+    auto it = iommu_cache_.find(fd);
+    if (it != iommu_cache_.end()) {
+      *out_addr = it->second.iommu_addr;
+      return true;
+    }
+    user_iommu_param iommu;
+    std::memset(&iommu, 0, sizeof(iommu));
+    iommu.fd = fd;
+    g_api.VideoEncoderGetVeIommuAddr(enc_, &iommu);
+    if (iommu.iommu_addr == 0) {
+      return false;
+    }
+    iommu_cache_.emplace(fd, iommu);
+    *out_addr = iommu.iommu_addr;
+    return true;
+  }
+
+  void clear_iommu_cache() {
+    if (enc_) {
+      for (auto &kv : iommu_cache_) {
+        if (kv.second.iommu_addr != 0) {
+          g_api.VideoEncoderFreeVeIommuAddr(enc_, &kv.second);
+          kv.second.iommu_addr = 0;
+        }
+      }
+    }
+    iommu_cache_.clear();
+  }
+
+  void collect_previous_result(const uint8_t **out_data, size_t *out_size,
+                               int *out_keyframe, bool *had_error,
+                               std::string *err_out) {
+    VideoPicture *prev_pic = nullptr;
+    int prev_ret = 0;
+    int prev_kf = 0;
+    std::string prev_err;
+    bool has_result = false;
+
+    {
+      std::unique_lock<std::mutex> lk(mtx_);
+      cv_.wait(lk, [this]() { return !job_pending_ && !job_running_; });
+      if (result_ready_) {
+        has_result = true;
+        prev_pic = done_pic_;
+        done_pic_ = nullptr;
+        prev_ret = done_ret_;
+        prev_kf = done_keyframe_;
+        prev_err = std::move(done_error_);
+        done_error_.clear();
+        out_buf_.swap(worker_out_buf_);
+        worker_out_buf_.clear();
+        result_ready_ = false;
+      }
+    }
+
+    if (prev_pic && dec_) {
+      g_api.ReturnPicture(dec_, prev_pic);
+    }
+
+    if (!has_result) {
+      return;
+    }
+
+    if (prev_ret < 0) {
+      *had_error = true;
+      *err_out = prev_err;
+      out_buf_.clear();
+      return;
+    }
+
+    if (!out_buf_.empty()) {
+      *out_data = out_buf_.data();
+      *out_size = out_buf_.size();
+      *out_keyframe = prev_kf;
+    }
+  }
+
+  int encode_picture_on_ve2(VideoPicture *pic, int64_t pts_us, int force_idr,
+                            VENC_PIXEL_FMT decoded_venc_fmt, int pic_stride,
+                            std::vector<uint8_t> &dst_buf, int *out_keyframe,
+                            std::string *err_out) {
+    dst_buf.clear();
+    *out_keyframe = 0;
+
     if (decoded_venc_fmt != enc_fmt_ || pic_stride != enc_stride_) {
       LOG_INFO(std::string("CedarC MJPEG: adapting VE2 encoder to fmt=") +
                std::to_string(static_cast<int>(decoded_venc_fmt)) +
                " stride=" + std::to_string(pic_stride));
       if (!init_encoder(decoded_venc_fmt, pic_stride)) {
+        *err_out = g_last_error;
         return -1;
       }
     }
 
-    // 3. Zero-copy DMA-buf -> VE2 IOMMU mapping
-    if (pic->nBufFd <= 0) {
-      set_last_error("CedarC VE1 decoded picture has no DMA-buf fd");
+    unsigned int iommu_addr = 0;
+    if (!map_dmabuf_iommu(pic->nBufFd, &iommu_addr)) {
+      *err_out = "CedarC VideoEncoderGetVeIommuAddr failed for fd=" +
+                 std::to_string(pic->nBufFd);
       return -1;
     }
-
-    user_iommu_param iommu;
-    std::memset(&iommu, 0, sizeof(iommu));
-    iommu.fd = pic->nBufFd;
-    g_api.VideoEncoderGetVeIommuAddr(enc_, &iommu);
-    if (iommu.iommu_addr == 0) {
-      set_last_error("CedarC VideoEncoderGetVeIommuAddr failed for fd=" +
-                     std::to_string(pic->nBufFd));
-      return -1;
-    }
-
-    struct IommuGuard {
-      VideoEncoder *enc;
-      user_iommu_param *param;
-      ~IommuGuard() {
-        if (enc && param && param->iommu_addr != 0) {
-          g_api.VideoEncoderFreeVeIommuAddr(enc, param);
-          param->iommu_addr = 0;
-        }
-      }
-    } iommu_guard{enc_, &iommu};
 
     const int pic_h = (pic->nHeight > 0) ? pic->nHeight : align16(height_);
     const uintptr_t c_off =
@@ -647,7 +825,7 @@ public:
             ? static_cast<uintptr_t>(pic->phyCBufAddr - pic->phyYBufAddr)
             : static_cast<uintptr_t>(pic_stride) *
                   static_cast<uintptr_t>(pic_h);
-    const uintptr_t phy_y = static_cast<uintptr_t>(iommu.iommu_addr);
+    const uintptr_t phy_y = static_cast<uintptr_t>(iommu_addr);
     const uintptr_t phy_c = phy_y + c_off;
 
     if (force_idr) {
@@ -667,10 +845,9 @@ public:
     inbuf.bAllocMemSelf = 0;
     inbuf.nShareBufFd = pic->nBufFd;
 
-    ret = g_api.AddOneInputBuffer(enc_, &inbuf);
+    int ret = g_api.AddOneInputBuffer(enc_, &inbuf);
     if (ret != 0) {
-      set_last_error("CedarC VE2 AddOneInputBuffer failed: " +
-                     std::to_string(ret));
+      *err_out = "CedarC VE2 AddOneInputBuffer failed: " + std::to_string(ret);
       return -1;
     }
 
@@ -680,18 +857,14 @@ public:
     std::memset(&used, 0, sizeof(used));
     g_api.AlreadyUsedInputBuffer(enc_, &used);
 
-    // Unmap IOMMU before leaving scope (iommu_guard also ensures this).
-    g_api.VideoEncoderFreeVeIommuAddr(enc_, &iommu);
-    iommu.iommu_addr = 0;
-
     if (enc_ret == VENC_RESULT_NO_FRAME_BUFFER ||
         enc_ret == VENC_RESULT_BITSTREAM_IS_EMPTY ||
         enc_ret == VENC_RESULT_DROP_FRAME) {
       return 0;
     }
     if (enc_ret != VENC_RESULT_OK) {
-      set_last_error("CedarC VE2 VideoEncodeOneFrame failed: " +
-                     std::to_string(enc_ret));
+      *err_out =
+          "CedarC VE2 VideoEncodeOneFrame failed: " + std::to_string(enc_ret);
       return -1;
     }
 
@@ -718,8 +891,8 @@ public:
       return 0;
     }
 
-    out_buf_.resize(total_size);
-    uint8_t *dst = out_buf_.data();
+    dst_buf.resize(total_size);
+    uint8_t *dst = dst_buf.data();
     if (need_header) {
       std::memcpy(dst, header_.data(), header_.size());
       dst += header_.size();
@@ -737,14 +910,54 @@ public:
     }
     g_api.FreeOneBitStreamFrame(enc_, &outbuf);
 
-    *out_data = out_buf_.data();
-    *out_size = out_buf_.size();
     *out_keyframe = is_key;
     return 0;
   }
 
-private:
+  void enc_worker_loop() {
+    for (;;) {
+      VideoPicture *pic = nullptr;
+      int64_t pts_us = 0;
+      int force_idr = 0;
+      VENC_PIXEL_FMT fmt = VENC_PIXEL_YUV420SP;
+      int stride = 0;
+
+      {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait(lk, [this]() { return worker_stop_ || job_pending_; });
+        if (worker_stop_ && !job_pending_) {
+          return;
+        }
+        pic = job_pic_;
+        job_pic_ = nullptr;
+        pts_us = job_pts_us_;
+        force_idr = job_force_idr_;
+        fmt = job_fmt_;
+        stride = job_stride_;
+        job_pending_ = false;
+        job_running_ = true;
+      }
+
+      std::string err;
+      int kf = 0;
+      int ret = encode_picture_on_ve2(pic, pts_us, force_idr, fmt, stride,
+                                      worker_out_buf_, &kf, &err);
+
+      {
+        std::lock_guard<std::mutex> lk(mtx_);
+        done_pic_ = pic;
+        done_ret_ = ret;
+        done_error_ = std::move(err);
+        done_keyframe_ = kf;
+        result_ready_ = true;
+        job_running_ = false;
+      }
+      cv_.notify_all();
+    }
+  }
+
   bool init_encoder(VENC_PIXEL_FMT fmt, int stride) {
+    clear_iommu_cache();
     if (enc_) {
       g_api.VideoEncDestroy(enc_);
       enc_ = nullptr;
@@ -770,6 +983,8 @@ private:
       // Allwinner VE2 v2 (e.g. A733) H.264 hardware unconditionally emits
       // High-profile 8x8 transform macroblock syntax; Baseline/Main PPS omits
       // transform_8x8_mode_flag and produces undecodable/green streams.
+      // Use AW_CBR (matching Allwinner vencoderdemo) with tighter QP bounds so
+      // static KVM screens do not drop to QP 45 and blur.
       h264.bEntropyCodingCABAC = 1;
       h264.nBitrate = bitrate_bps;
       h264.nFramerate = fps_;
@@ -779,19 +994,17 @@ private:
       h264.sProfileLevel.nProfile = VENC_H264ProfileHigh;
       h264.sProfileLevel.nLevel = (width_ >= 2560 || height_ >= 1440)
                                       ? VENC_H264Level51
-                                      : VENC_H264Level41;
-      h264.sQPRange.nMinqp = 15;
-      h264.sQPRange.nMaxqp = 45;
-      h264.sQPRange.nMinPqp = 15;
-      h264.sQPRange.nMaxPqp = 45;
-      h264.sQPRange.nQpInit = 28;
+                                      : (fps_ > 30 || width_ >= 1920)
+                                            ? VENC_H264Level42
+                                            : VENC_H264Level41;
+      h264.sQPRange.nMinqp = 10;
+      h264.sQPRange.nMaxqp = 38;
+      h264.sQPRange.nMinPqp = 10;
+      h264.sQPRange.nMaxPqp = 38;
+      h264.sQPRange.nQpInit = 24;
       h264.sGopParam.bUseGopCtrlEn = 1;
       h264.sGopParam.eGopMode = AW_NORMALP;
-      h264.sRcParam.eRcMode = AW_VBR;
-      h264.sRcParam.sVbrParam.uMaxBitRate =
-          static_cast<unsigned int>(bitrate_bps) * 2u;
-      h264.sRcParam.sVbrParam.nMovingTh = 20;
-      h264.sRcParam.sVbrParam.nQuality = 10;
+      h264.sRcParam.eRcMode = AW_CBR;
 
       int ret = g_api.VideoEncSetParameter(enc_, VENC_IndexParamH264Param,
                                            &h264);
@@ -809,23 +1022,19 @@ private:
       h265.nGopSize = gop_;
       h265.nIntraPeriod = gop_;
       h265.idr_period = gop_;
-      h265.nQPInit = 28;
+      h265.nQPInit = 24;
       h265.sProfileLevel.nProfile = VENC_H265ProfileMain;
       h265.sProfileLevel.nLevel = (width_ >= 2560 || height_ >= 1440)
                                       ? VENC_H265Level51
                                       : VENC_H265Level41;
-      h265.sQPRange.nMinqp = 15;
-      h265.sQPRange.nMaxqp = 45;
-      h265.sQPRange.nMinPqp = 15;
-      h265.sQPRange.nMaxPqp = 45;
-      h265.sQPRange.nQpInit = 28;
+      h265.sQPRange.nMinqp = 10;
+      h265.sQPRange.nMaxqp = 38;
+      h265.sQPRange.nMinPqp = 10;
+      h265.sQPRange.nMaxPqp = 38;
+      h265.sQPRange.nQpInit = 24;
       h265.sGopParam.bUseGopCtrlEn = 1;
       h265.sGopParam.eGopMode = AW_NORMALP;
-      h265.sRcParam.eRcMode = AW_VBR;
-      h265.sRcParam.sVbrParam.uMaxBitRate =
-          static_cast<unsigned int>(bitrate_bps) * 2u;
-      h265.sRcParam.sVbrParam.nMovingTh = 20;
-      h265.sRcParam.sVbrParam.nQuality = 10;
+      h265.sRcParam.eRcMode = AW_CBR;
 
       int ret = g_api.VideoEncSetParameter(enc_, VENC_IndexParamH265Param,
                                            &h265);
@@ -867,6 +1076,25 @@ private:
   }
 
   void cleanup() {
+    if (enc_thread_.joinable()) {
+      {
+        std::lock_guard<std::mutex> lk(mtx_);
+        worker_stop_ = true;
+      }
+      cv_.notify_all();
+      enc_thread_.join();
+    }
+    if (dec_) {
+      if (job_pic_) {
+        g_api.ReturnPicture(dec_, job_pic_);
+        job_pic_ = nullptr;
+      }
+      if (done_pic_) {
+        g_api.ReturnPicture(dec_, done_pic_);
+        done_pic_ = nullptr;
+      }
+    }
+    clear_iommu_cache();
     if (enc_) {
       g_api.VideoEncDestroy(enc_);
       enc_ = nullptr;
