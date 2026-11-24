@@ -1272,8 +1272,9 @@ impl WebRtcStreamer {
 
     /// Set bitrate using preset
     ///
-    /// Note: Hardware encoders (VAAPI, NVENC, etc.) don't support dynamic bitrate changes.
-    /// This method restarts the pipeline to apply the new bitrate only if the preset actually changed.
+    /// Backends supporting dynamic bitrate reconfiguration (such as Allwinner VE / CedarC)
+    /// apply the new bitrate in-place without restarting the pipeline. Other hardware encoders
+    /// restart the pipeline only if the preset actually changed.
     pub async fn set_bitrate_preset(&self, preset: BitratePreset) -> Result<()> {
         // Check if preset actually changed
         let current_preset = self.config.read().await.bitrate_preset;
@@ -1286,15 +1287,21 @@ impl WebRtcStreamer {
         self.config.write().await.bitrate_preset = preset;
 
         // Check if pipeline exists and is running
-        let pipeline_running = {
-            if let Some(ref pipeline) = *self.video_pipeline.read().await {
-                pipeline.is_running()
-            } else {
-                false
-            }
+        let running_pipeline = {
+            let guard = self.video_pipeline.read().await;
+            guard.as_ref().filter(|p| p.is_running()).cloned()
         };
 
-        if pipeline_running {
+        if let Some(pipeline) = running_pipeline {
+            if pipeline.supports_dynamic_bitrate() {
+                info!(
+                    "Applying new bitrate dynamically without restarting pipeline: {}",
+                    preset
+                );
+                pipeline.set_bitrate_preset(preset).await?;
+                return Ok(());
+            }
+
             info!("Restarting video pipeline to apply new bitrate: {}", preset);
 
             self.stop_video_pipeline_and_release().await?;

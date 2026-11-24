@@ -552,6 +552,7 @@ pub struct SharedVideoPipeline {
     h264_profile_level_id: watch::Sender<Option<String>>,
     h264_profile_level_id_rx: watch::Receiver<Option<String>>,
     cmd_tx: ParkingRwLock<Option<tokio::sync::mpsc::UnboundedSender<PipelineCmd>>>,
+    supports_dynamic_bitrate: AtomicBool,
     /// Fast running flag for blocking capture loop
     running_flag: AtomicBool,
     /// Frame sequence counter (atomic for lock-free access)
@@ -615,6 +616,7 @@ impl SharedVideoPipeline {
             h264_profile_level_id: h264_profile_tx,
             h264_profile_level_id_rx: h264_profile_rx,
             cmd_tx: ParkingRwLock::new(None),
+            supports_dynamic_bitrate: AtomicBool::new(false),
             running_flag: AtomicBool::new(false),
             sequence: AtomicU64::new(0),
             keyframe_requested: AtomicBool::new(false),
@@ -670,6 +672,10 @@ impl SharedVideoPipeline {
         if let Some(notifier) = self.state_notifier.read().clone() {
             notifier(notification);
         }
+    }
+
+    pub fn supports_dynamic_bitrate(&self) -> bool {
+        self.supports_dynamic_bitrate.load(Ordering::Acquire)
     }
 
     /// Subscribe to encoded frames
@@ -737,12 +743,22 @@ impl SharedVideoPipeline {
                             .map_err(|e| {
                                 AppError::VideoError(format!("HW MJPEG reconfigure failed: {}", e))
                             })?;
+                        self.keyframe_requested.store(true, Ordering::Release);
+                        info!(
+                            "[Pipeline] Dynamically reconfigured bitrate to {} ({} kbps)",
+                            preset, bitrate_kbps
+                        );
                         return Ok(());
                     }
                 }
 
                 if let Some(ref mut encoder) = state.encoder {
                     encoder.set_bitrate(bitrate_kbps)?;
+                    self.keyframe_requested.store(true, Ordering::Release);
+                    info!(
+                        "[Pipeline] Dynamically updated encoder bitrate to {} ({} kbps)",
+                        preset, bitrate_kbps
+                    );
                 }
             }
         }
@@ -1183,6 +1199,8 @@ impl SharedVideoPipeline {
             info!("MJPEG admission policy: {:?}", admission_policy);
         }
         let mut encoder_state = build_encoder_state(&encoder_config)?;
+        self.supports_dynamic_bitrate
+            .store(encoder_state.supports_dynamic_bitrate(), Ordering::Release);
         let frame_mailbox = Arc::new(VideoFrameMailbox::new());
         *self.frame_mailbox.lock() = Some(frame_mailbox.clone());
         self.mjpeg_decoded_frames.store(0, Ordering::Relaxed);
@@ -1308,6 +1326,9 @@ impl SharedVideoPipeline {
                 }
 
                 pipeline.clear_cmd_tx();
+                pipeline
+                    .supports_dynamic_bitrate
+                    .store(false, Ordering::Release);
                 // Release encoder resources before allowing a replacement pipeline.
                 drop(encoder_state);
                 let _ = pipeline.encoder_done.send(true);
@@ -1845,6 +1866,8 @@ impl SharedVideoPipeline {
                 Ok(packet) => packet,
                 Err(err) => {
                     fallback_hw_mjpeg_pipeline(state, &err)?;
+                    self.supports_dynamic_bitrate
+                        .store(state.supports_dynamic_bitrate(), Ordering::Release);
                     if state.ffmpeg_hw_enabled {
                         state
                             .ffmpeg_hw_pipeline
@@ -2005,6 +2028,8 @@ impl SharedVideoPipeline {
     /// Stop the pipeline (non-blocking, does not wait for capture thread to exit)
     pub fn stop(&self) {
         let was_running = self.running_flag.swap(false, Ordering::AcqRel);
+        self.supports_dynamic_bitrate
+            .store(false, Ordering::Release);
         if let Some(frame_mailbox) = self.frame_mailbox.lock().as_ref() {
             frame_mailbox.close();
         }

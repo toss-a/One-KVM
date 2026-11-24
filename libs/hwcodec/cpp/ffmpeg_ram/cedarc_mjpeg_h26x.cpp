@@ -450,6 +450,15 @@ public:
     if (!enc_) {
       return 0;
     }
+    if (codec_type_ == VENC_CODEC_H265) {
+      // VE2 H.265 ignores dynamic VENC_IndexParamBitrate updates after
+      // VideoEncInit; recreate only the VE2 instance in-place while keeping
+      // VE1 decoder, V4L2 capture, and subscribers uninterrupted.
+      if (!init_encoder(enc_fmt_, enc_stride_)) {
+        return -1;
+      }
+      return 0;
+    }
     if (kbps > 0) {
       int bps = std::max(kbs_, 64) * 1000;
       int ret = g_api.VideoEncSetParameter(enc_, VENC_IndexParamBitrate, &bps);

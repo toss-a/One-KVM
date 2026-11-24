@@ -145,6 +145,22 @@ pub(super) struct EncoderThreadState {
     pub(super) input_format: PixelFormat,
 }
 
+impl EncoderThreadState {
+    pub(super) fn supports_dynamic_bitrate(&self) -> bool {
+        #[cfg(any(feature = "rkmpp", target_os = "linux"))]
+        if self.ffmpeg_hw_enabled {
+            #[cfg(target_os = "linux")]
+            if matches!(self.ffmpeg_hw_pipeline, Some(HwMjpegPipeline::Cedarc(_))) {
+                return true;
+            }
+            return false;
+        }
+        self.encoder
+            .as_ref()
+            .is_some_and(|enc| enc.codec_name() == "h264_cedarc")
+    }
+}
+
 pub(super) trait VideoEncoderTrait: Send {
     fn encode_raw(&mut self, data: &[u8], pts_ms: i64) -> Result<Vec<EncodedFrame>>;
     fn supports_owned_nv12_input(&self) -> bool {
