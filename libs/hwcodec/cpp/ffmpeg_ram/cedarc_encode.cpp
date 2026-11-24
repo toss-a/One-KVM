@@ -1,5 +1,6 @@
 #include "cedarc_encode.h"
 #include "cedarc_abi.h"
+#include "cedarc_common.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -73,19 +74,7 @@ static void set_last_error(const std::string &msg) { g_last_error = msg; }
 
 static bool load_cedarc_api() {
   std::call_once(g_api_once, []() {
-    const char *lib_names[] = {
-        "libvencoder.so",
-        "/usr/lib/aarch64-linux-gnu/libvencoder.so",
-        "/usr/lib/arm-linux-gnueabihf/libvencoder.so",
-        "/usr/lib/libvencoder.so",
-    };
-    void *h = nullptr;
-    for (const char *lib : lib_names) {
-      h = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
-      if (h) {
-        break;
-      }
-    }
+    void *h = cedarc_common::dlopen_lib("libvencoder.so", RTLD_NOW | RTLD_LOCAL);
     if (!h) {
       LOG_TRACE(std::string("CedarC: libvencoder.so not found"));
       return;
@@ -125,8 +114,6 @@ static bool load_cedarc_api() {
   return g_api.loaded;
 }
 
-static inline int align16(int v) { return (v + 15) & ~15; }
-
 static bool map_pixel_format(int av_pixfmt, VENC_PIXEL_FMT *out_fmt,
                              bool *out_is_packed_422,
                              bool *out_is_planar_420) {
@@ -160,31 +147,6 @@ static bool map_pixel_format(int av_pixfmt, VENC_PIXEL_FMT *out_fmt,
   }
 }
 
-static bool packet_has_param_sets(const uint8_t *data, size_t size,
-                                  VENC_CODEC_TYPE codec) {
-  if (!data || size < 5) {
-    return false;
-  }
-  size_t offset = 0;
-  if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) {
-    offset = 4;
-  } else if (data[0] == 0 && data[1] == 0 && data[2] == 1) {
-    offset = 3;
-  } else {
-    return false;
-  }
-  if (offset >= size) {
-    return false;
-  }
-  if (codec == VENC_CODEC_H264) {
-    return (data[offset] & 0x1f) == 7; // SPS
-  }
-  if (codec == VENC_CODEC_H265) {
-    return ((data[offset] >> 1) & 0x3f) == 32; // VPS
-  }
-  return false;
-}
-
 class CedarcEncoder {
 public:
   std::string name_;
@@ -200,7 +162,6 @@ public:
   int align_ = 1;
   int fps_ = 30;
   int gop_ = 30;
-  int rc_ = RC_VBR;
   int kbs_ = 2000;
   CedarcEncodeCallback callback_ = nullptr;
 
@@ -211,13 +172,12 @@ public:
   std::vector<uint8_t> staging_buf_;
 
   CedarcEncoder(const char *name, int width, int height, int pixfmt, int align,
-                int fps, int gop, int rc, int kbs,
-                CedarcEncodeCallback callback)
+                int fps, int gop, int kbs, CedarcEncodeCallback callback)
       : name_(name ? name : ""), av_pixfmt_(pixfmt), width_(width),
-        height_(height), aligned_w_(align16(width)),
-        aligned_h_(align16(height)), align_(align),
+        height_(height), aligned_w_(cedarc_common::align16(width)),
+        aligned_h_(cedarc_common::align16(height)), align_(align),
         fps_(fps > 0 ? fps : 30), gop_(gop > 0 ? gop : (fps > 0 ? fps : 30)),
-        rc_(rc), kbs_(kbs > 0 ? kbs : 2000), callback_(callback) {}
+        kbs_(kbs > 0 ? kbs : 2000), callback_(callback) {}
 
   ~CedarcEncoder() { free_encoder(); }
 
@@ -265,42 +225,12 @@ public:
     }
 
     unsigned int vbv_size =
-        (width_ >= 2560 || height_ >= 1440) ? (8u * 1024u * 1024u)
-                                            : (4u * 1024u * 1024u);
+        cedarc_common::vbv_size_for_resolution(width_, height_);
     g_api.VideoEncSetParameter(enc_, VENC_IndexParamSetVbvSize, &vbv_size);
 
-    const int bitrate_bps = std::max(kbs_, 64) * 1000;
-    // VE2 AW_VBR pins static KVM screens to nMaxqp (crushing bitrate and
-    // blurring text), and tuned VBR thresholds can stall VE2 hardware; use
-    // AW_CBR (matching Allwinner vencoderdemo) with tighter QP bounds instead.
-    const VENC_RC_MODE rc_mode = AW_CBR;
-
     if (codec_type_ == VENC_CODEC_H264) {
-      VencH264Param h264;
-      std::memset(&h264, 0, sizeof(h264));
-      // Allwinner VE2 v2 (e.g. A733) H.264 hardware unconditionally emits
-      // High-profile 8x8 transform macroblock syntax; Baseline/Main PPS omits
-      // transform_8x8_mode_flag and produces undecodable/green streams.
-      h264.bEntropyCodingCABAC = 1;
-      h264.nBitrate = bitrate_bps;
-      h264.nFramerate = fps_;
-      h264.nSrcFramerate = fps_;
-      h264.nCodingMode = VENC_FRAME_CODING;
-      h264.nMaxKeyInterval = gop_;
-      h264.sProfileLevel.nProfile = VENC_H264ProfileHigh;
-      h264.sProfileLevel.nLevel = (width_ >= 2560 || height_ >= 1440)
-                                      ? VENC_H264Level51
-                                      : (fps_ > 30 || width_ >= 1920)
-                                            ? VENC_H264Level42
-                                            : VENC_H264Level41;
-      h264.sQPRange.nMinqp = 10;
-      h264.sQPRange.nMaxqp = 38;
-      h264.sQPRange.nMinPqp = 10;
-      h264.sQPRange.nMaxPqp = 38;
-      h264.sQPRange.nQpInit = 24;
-      h264.sGopParam.bUseGopCtrlEn = 1;
-      h264.sGopParam.eGopMode = AW_NORMALP;
-      h264.sRcParam.eRcMode = rc_mode;
+      VencH264Param h264 = cedarc_common::build_h264_cbr_param(
+          width_, height_, fps_, kbs_, gop_);
 
       int ret = g_api.VideoEncSetParameter(enc_, VENC_IndexParamH264Param,
                                            &h264);
@@ -310,27 +240,8 @@ public:
         return false;
       }
     } else {
-      VencH265Param h265;
-      std::memset(&h265, 0, sizeof(h265));
-      h265.nBitrate = bitrate_bps;
-      h265.nFramerate = fps_;
-      h265.nSrcFramerate = fps_;
-      h265.nGopSize = gop_;
-      h265.nIntraPeriod = gop_;
-      h265.idr_period = gop_;
-      h265.nQPInit = 24;
-      h265.sProfileLevel.nProfile = VENC_H265ProfileMain;
-      h265.sProfileLevel.nLevel = (width_ >= 2560 || height_ >= 1440)
-                                      ? VENC_H265Level51
-                                      : VENC_H265Level41;
-      h265.sQPRange.nMinqp = 10;
-      h265.sQPRange.nMaxqp = 38;
-      h265.sQPRange.nMinPqp = 10;
-      h265.sQPRange.nMaxPqp = 38;
-      h265.sQPRange.nQpInit = 24;
-      h265.sGopParam.bUseGopCtrlEn = 1;
-      h265.sGopParam.eGopMode = AW_NORMALP;
-      h265.sRcParam.eRcMode = rc_mode;
+      VencH265Param h265 = cedarc_common::build_h265_cbr_param(
+          width_, height_, fps_, kbs_, gop_);
 
       int ret = g_api.VideoEncSetParameter(enc_, VENC_IndexParamH265Param,
                                            &h265);
@@ -481,7 +392,8 @@ public:
     const int is_key = (outbuf.nFlag & VENC_BUFFERFLAG_KEYFRAME) ? 1 : 0;
     const bool need_header =
         is_key && !header_.empty() &&
-        !packet_has_param_sets(outbuf.pData0, outbuf.nSize0, codec_type_);
+        !cedarc_common::packet_has_param_sets(outbuf.pData0, outbuf.nSize0,
+                                              codec_type_);
 
     const size_t total_size =
         (need_header ? header_.size() : 0u) +
@@ -674,9 +586,10 @@ extern "C" void *cedarc_new_encoder(const char *name, int width, int height,
                                     int rc, int kbs, int *linesize, int *offset,
                                     int *length,
                                     CedarcEncodeCallback callback) {
+  (void)rc;
   try {
     auto *enc = new CedarcEncoder(name, width, height, pixfmt, align, fps, gop,
-                                  rc, kbs, callback);
+                                  kbs, callback);
     if (enc->init(linesize, offset, length)) {
       return enc;
     }

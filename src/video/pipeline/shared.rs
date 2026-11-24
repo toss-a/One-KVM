@@ -1868,13 +1868,13 @@ impl SharedVideoPipeline {
                 }
             };
 
-            if let Some((data, is_keyframe)) = packet {
+            if let Some((data, is_keyframe, out_pts_ms)) = packet {
                 let (data, is_keyframe) =
                     self.inspect_and_parameterize_packet(codec, Bytes::from(data), is_keyframe);
                 let sequence = self.sequence.fetch_add(1, Ordering::Relaxed) + 1;
                 return Ok(vec![EncodedVideoFrame {
                     data,
-                    pts_ms,
+                    pts_ms: out_pts_ms,
                     is_keyframe,
                     sequence,
                     duration: Duration::from_millis(1000 / fps as u64),

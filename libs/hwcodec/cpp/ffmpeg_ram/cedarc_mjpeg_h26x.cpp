@@ -1,5 +1,6 @@
 #include "cedarc_mjpeg_h26x.h"
 #include "cedarc_abi.h"
+#include "cedarc_common.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -91,34 +92,18 @@ static thread_local std::string g_last_error;
 
 static void set_last_error(const std::string &msg) { g_last_error = msg; }
 
-static void *dlopen_cedarc_lib(const char *soname, int flags) {
-  const std::string candidates[] = {
-      soname,
-      std::string("/usr/lib/aarch64-linux-gnu/") + soname,
-      std::string("/usr/lib/arm-linux-gnueabihf/") + soname,
-      std::string("/usr/lib/") + soname,
-  };
-  for (const auto &path : candidates) {
-    void *h = dlopen(path.c_str(), flags);
-    if (h) {
-      return h;
-    }
-  }
-  return nullptr;
-}
-
 static bool load_cedarc_mjpeg_api() {
   std::call_once(g_api_once, []() {
     // RTLD_GLOBAL is required so AddVDPlugin() can dlopen libawmjpeg.so and
     // resolve symbols from libvideoengine.so / libvdecoder.so.
     g_api.h_mem =
-        dlopen_cedarc_lib("libMemAdapter.so", RTLD_NOW | RTLD_GLOBAL);
+        cedarc_common::dlopen_lib("libMemAdapter.so", RTLD_NOW | RTLD_GLOBAL);
     g_api.h_ve =
-        dlopen_cedarc_lib("libvideoengine.so", RTLD_NOW | RTLD_GLOBAL);
+        cedarc_common::dlopen_lib("libvideoengine.so", RTLD_NOW | RTLD_GLOBAL);
     g_api.h_vdec =
-        dlopen_cedarc_lib("libvdecoder.so", RTLD_NOW | RTLD_GLOBAL);
+        cedarc_common::dlopen_lib("libvdecoder.so", RTLD_NOW | RTLD_GLOBAL);
     g_api.h_venc =
-        dlopen_cedarc_lib("libvencoder.so", RTLD_NOW | RTLD_GLOBAL);
+        cedarc_common::dlopen_lib("libvencoder.so", RTLD_NOW | RTLD_GLOBAL);
 
     if (!g_api.h_mem || !g_api.h_vdec || !g_api.h_venc) {
       LOG_TRACE(std::string(
@@ -180,8 +165,6 @@ static bool load_cedarc_mjpeg_api() {
   });
   return g_api.loaded;
 }
-
-static inline int align16(int v) { return (v + 15) & ~15; }
 
 // Standard ISO/IEC 10918-1 Annex K Huffman tables (DHT segment, 420 bytes).
 // Many UVC HDMI capture cards emit valid MJPEG frames without a DHT marker;
@@ -330,31 +313,6 @@ static bool map_decoder_pixfmt_to_venc(int dec_fmt, VENC_PIXEL_FMT *out_fmt) {
   }
 }
 
-static bool packet_has_param_sets(const uint8_t *data, size_t size,
-                                  VENC_CODEC_TYPE codec) {
-  if (!data || size < 5) {
-    return false;
-  }
-  size_t offset = 0;
-  if (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) {
-    offset = 4;
-  } else if (data[0] == 0 && data[1] == 0 && data[2] == 1) {
-    offset = 3;
-  } else {
-    return false;
-  }
-  if (offset >= size) {
-    return false;
-  }
-  if (codec == VENC_CODEC_H264) {
-    return (data[offset] & 0x1f) == 7; // SPS
-  }
-  if (codec == VENC_CODEC_H265) {
-    return ((data[offset] >> 1) & 0x3f) == 32; // VPS
-  }
-  return false;
-}
-
 class CedarcMjpegH26xPipeline {
 public:
   VENC_CODEC_TYPE codec_type_ = VENC_CODEC_H264;
@@ -400,6 +358,7 @@ public:
   std::string done_error_;
   std::vector<uint8_t> worker_out_buf_;
   int done_keyframe_ = 0;
+  int64_t done_pts_us_ = 0;
 
   CedarcMjpegH26xPipeline(int codec, int width, int height, int fps, int kbps,
                           int gop)
@@ -471,7 +430,7 @@ public:
 
     // Initialize VE2 encoder upfront with standard NV12 + 16-aligned stride so
     // hardware availability is validated immediately during pipeline setup.
-    if (!init_encoder(VENC_PIXEL_YUV420SP, align16(width_))) {
+    if (!init_encoder(VENC_PIXEL_YUV420SP, cedarc_common::align16(width_))) {
       return false;
     }
 
@@ -480,15 +439,14 @@ public:
   }
 
   int reconfigure(int kbps, int gop) {
+    std::unique_lock<std::mutex> lk(mtx_);
+    cv_.wait(lk, [this]() { return !job_pending_ && !job_running_; });
     if (kbps > 0) {
       kbs_ = kbps;
     }
     if (gop > 0) {
       gop_ = gop;
     }
-
-    std::unique_lock<std::mutex> lk(mtx_);
-    cv_.wait(lk, [this]() { return !job_pending_ && !job_running_; });
     if (!enc_) {
       return 0;
     }
@@ -511,12 +469,15 @@ public:
 
   int encode(const uint8_t *jpeg_data, size_t jpeg_len, int64_t pts_us,
              int force_idr, const uint8_t **out_data, size_t *out_size,
-             int *out_keyframe) {
+             int *out_keyframe, int64_t *out_pts_us) {
     *out_data = nullptr;
     *out_size = 0;
     *out_keyframe = 0;
+    if (out_pts_us) {
+      *out_pts_us = 0;
+    }
 
-    if (!dec_ || !enc_) {
+    if (!dec_ || !enc_thread_.joinable()) {
       set_last_error("CedarC MJPEG pipeline not initialized");
       return -1;
     }
@@ -524,8 +485,8 @@ public:
     if (jpeg_data == nullptr && jpeg_len == 0) {
       bool prev_err = false;
       std::string err_msg;
-      collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
-                              &err_msg);
+      collect_previous_result(out_data, out_size, out_keyframe, out_pts_us,
+                              &prev_err, &err_msg);
       if (prev_err) {
         set_last_error(err_msg);
         return -1;
@@ -539,8 +500,8 @@ public:
                                &submit_ptr, &submit_len)) {
       bool prev_err = false;
       std::string err_msg;
-      collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
-                              &err_msg);
+      collect_previous_result(out_data, out_size, out_keyframe, out_pts_us,
+                              &prev_err, &err_msg);
       if (prev_err) {
         set_last_error(err_msg);
         return -1;
@@ -555,6 +516,10 @@ public:
       return -1;
     }
 
+    bool prev_collected = false;
+    bool prev_err = false;
+    std::string prev_err_msg;
+
     // 1. Submit JPEG bitstream to VE1 (runs while VE2 worker encodes N-1).
     char *buf = nullptr;
     char *ring = nullptr;
@@ -564,6 +529,15 @@ public:
         dec_, static_cast<int>(submit_len), &buf, &buf_sz, &ring, &ring_sz, 0);
     if (ret != 0 || !buf || (buf_sz + ring_sz) < static_cast<int>(submit_len)) {
       if (g_api.ResetVideoDecoder) {
+        if (!prev_collected) {
+          collect_previous_result(out_data, out_size, out_keyframe, out_pts_us,
+                                  &prev_err, &prev_err_msg);
+          prev_collected = true;
+          if (prev_err) {
+            set_last_error(prev_err_msg);
+            return -1;
+          }
+        }
         g_api.ResetVideoDecoder(dec_);
         ret = g_api.RequestVideoStreamBuffer(dec_, static_cast<int>(submit_len),
                                              &buf, &buf_sz, &ring, &ring_sz, 0);
@@ -601,10 +575,6 @@ public:
     }
 
     // 2. Hardware MJPEG decode on VE1 in parallel with VE2 encoding N-1.
-    bool prev_collected = false;
-    bool prev_err = false;
-    std::string prev_err_msg;
-
     VideoPicture *pic = nullptr;
     int last_dret = VDECODE_RESULT_OK;
     for (int attempt = 0; attempt < 4; ++attempt) {
@@ -615,8 +585,8 @@ public:
       }
       if (last_dret == VDECODE_RESULT_NO_FRAME_BUFFER && !prev_collected) {
         // Wait for VE2 and return N-1 picture to VE1 FBM, then retry decode.
-        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
-                                &prev_err_msg);
+        collect_previous_result(out_data, out_size, out_keyframe, out_pts_us,
+                                &prev_err, &prev_err_msg);
         prev_collected = true;
         if (prev_err) {
           set_last_error(prev_err_msg);
@@ -632,8 +602,8 @@ public:
 
     if (!pic) {
       if (!prev_collected) {
-        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
-                                &prev_err_msg);
+        collect_previous_result(out_data, out_size, out_keyframe, out_pts_us,
+                                &prev_err, &prev_err_msg);
         prev_collected = true;
         if (prev_err) {
           set_last_error(prev_err_msg);
@@ -656,8 +626,8 @@ public:
     if (pic->bFrameErrorFlag != 0) {
       g_api.ReturnPicture(dec_, pic);
       if (!prev_collected) {
-        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
-                                &prev_err_msg);
+        collect_previous_result(out_data, out_size, out_keyframe, out_pts_us,
+                                &prev_err, &prev_err_msg);
         if (prev_err) {
           set_last_error(prev_err_msg);
           return -1;
@@ -671,8 +641,8 @@ public:
       const int bad_fmt = pic->ePixelFormat;
       g_api.ReturnPicture(dec_, pic);
       if (!prev_collected) {
-        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
-                                &prev_err_msg);
+        collect_previous_result(out_data, out_size, out_keyframe, out_pts_us,
+                                &prev_err, &prev_err_msg);
       }
       set_last_error("Unsupported VE1 decoded pixel format for VE2: " +
                      std::to_string(bad_fmt));
@@ -682,20 +652,21 @@ public:
     if (pic->nBufFd <= 0) {
       g_api.ReturnPicture(dec_, pic);
       if (!prev_collected) {
-        collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
-                                &prev_err_msg);
+        collect_previous_result(out_data, out_size, out_keyframe, out_pts_us,
+                                &prev_err, &prev_err_msg);
       }
       set_last_error("CedarC VE1 decoded picture has no DMA-buf fd");
       return -1;
     }
 
     const int pic_stride =
-        (pic->nLineStride > 0) ? pic->nLineStride : align16(width_);
+        (pic->nLineStride > 0) ? pic->nLineStride
+                               : cedarc_common::align16(width_);
 
     // 3. Collect frame N-1 result and return its VE1 picture before dispatching N.
     if (!prev_collected) {
-      collect_previous_result(out_data, out_size, out_keyframe, &prev_err,
-                              &prev_err_msg);
+      collect_previous_result(out_data, out_size, out_keyframe, out_pts_us,
+                              &prev_err, &prev_err_msg);
       if (prev_err) {
         g_api.ReturnPicture(dec_, pic);
         set_last_error(prev_err_msg);
@@ -748,11 +719,12 @@ private:
   }
 
   void collect_previous_result(const uint8_t **out_data, size_t *out_size,
-                               int *out_keyframe, bool *had_error,
-                               std::string *err_out) {
+                               int *out_keyframe, int64_t *out_pts_us,
+                               bool *had_error, std::string *err_out) {
     VideoPicture *prev_pic = nullptr;
     int prev_ret = 0;
     int prev_kf = 0;
+    int64_t prev_pts_us = 0;
     std::string prev_err;
     bool has_result = false;
 
@@ -765,6 +737,8 @@ private:
         done_pic_ = nullptr;
         prev_ret = done_ret_;
         prev_kf = done_keyframe_;
+        prev_pts_us = done_pts_us_;
+        done_pts_us_ = 0;
         prev_err = std::move(done_error_);
         done_error_.clear();
         out_buf_.swap(worker_out_buf_);
@@ -792,6 +766,9 @@ private:
       *out_data = out_buf_.data();
       *out_size = out_buf_.size();
       *out_keyframe = prev_kf;
+      if (out_pts_us) {
+        *out_pts_us = prev_pts_us;
+      }
     }
   }
 
@@ -802,7 +779,7 @@ private:
     dst_buf.clear();
     *out_keyframe = 0;
 
-    if (decoded_venc_fmt != enc_fmt_ || pic_stride != enc_stride_) {
+    if (!enc_ || decoded_venc_fmt != enc_fmt_ || pic_stride != enc_stride_) {
       LOG_INFO(std::string("CedarC MJPEG: adapting VE2 encoder to fmt=") +
                std::to_string(static_cast<int>(decoded_venc_fmt)) +
                " stride=" + std::to_string(pic_stride));
@@ -819,7 +796,8 @@ private:
       return -1;
     }
 
-    const int pic_h = (pic->nHeight > 0) ? pic->nHeight : align16(height_);
+    const int pic_h =
+        (pic->nHeight > 0) ? pic->nHeight : cedarc_common::align16(height_);
     const uintptr_t c_off =
         (pic->phyCBufAddr >= pic->phyYBufAddr && pic->phyCBufAddr > 0)
             ? static_cast<uintptr_t>(pic->phyCBufAddr - pic->phyYBufAddr)
@@ -878,7 +856,8 @@ private:
     const int is_key = (outbuf.nFlag & VENC_BUFFERFLAG_KEYFRAME) ? 1 : 0;
     const bool need_header =
         is_key && !header_.empty() &&
-        !packet_has_param_sets(outbuf.pData0, outbuf.nSize0, codec_type_);
+        !cedarc_common::packet_has_param_sets(outbuf.pData0, outbuf.nSize0,
+                                              codec_type_);
 
     const size_t total_size =
         (need_header ? header_.size() : 0u) +
@@ -949,6 +928,7 @@ private:
         done_ret_ = ret;
         done_error_ = std::move(err);
         done_keyframe_ = kf;
+        done_pts_us_ = pts_us;
         result_ready_ = true;
         job_running_ = false;
       }
@@ -971,40 +951,12 @@ private:
     }
 
     unsigned int vbv_size =
-        (width_ >= 2560 || height_ >= 1440) ? (8u * 1024u * 1024u)
-                                            : (4u * 1024u * 1024u);
+        cedarc_common::vbv_size_for_resolution(width_, height_);
     g_api.VideoEncSetParameter(enc_, VENC_IndexParamSetVbvSize, &vbv_size);
 
-    const int bitrate_bps = std::max(kbs_, 64) * 1000;
-
     if (codec_type_ == VENC_CODEC_H264) {
-      VencH264Param h264;
-      std::memset(&h264, 0, sizeof(h264));
-      // Allwinner VE2 v2 (e.g. A733) H.264 hardware unconditionally emits
-      // High-profile 8x8 transform macroblock syntax; Baseline/Main PPS omits
-      // transform_8x8_mode_flag and produces undecodable/green streams.
-      // Use AW_CBR (matching Allwinner vencoderdemo) with tighter QP bounds so
-      // static KVM screens do not drop to QP 45 and blur.
-      h264.bEntropyCodingCABAC = 1;
-      h264.nBitrate = bitrate_bps;
-      h264.nFramerate = fps_;
-      h264.nSrcFramerate = fps_;
-      h264.nCodingMode = VENC_FRAME_CODING;
-      h264.nMaxKeyInterval = gop_;
-      h264.sProfileLevel.nProfile = VENC_H264ProfileHigh;
-      h264.sProfileLevel.nLevel = (width_ >= 2560 || height_ >= 1440)
-                                      ? VENC_H264Level51
-                                      : (fps_ > 30 || width_ >= 1920)
-                                            ? VENC_H264Level42
-                                            : VENC_H264Level41;
-      h264.sQPRange.nMinqp = 10;
-      h264.sQPRange.nMaxqp = 38;
-      h264.sQPRange.nMinPqp = 10;
-      h264.sQPRange.nMaxPqp = 38;
-      h264.sQPRange.nQpInit = 24;
-      h264.sGopParam.bUseGopCtrlEn = 1;
-      h264.sGopParam.eGopMode = AW_NORMALP;
-      h264.sRcParam.eRcMode = AW_CBR;
+      VencH264Param h264 = cedarc_common::build_h264_cbr_param(
+          width_, height_, fps_, kbs_, gop_);
 
       int ret = g_api.VideoEncSetParameter(enc_, VENC_IndexParamH264Param,
                                            &h264);
@@ -1014,27 +966,8 @@ private:
         return false;
       }
     } else {
-      VencH265Param h265;
-      std::memset(&h265, 0, sizeof(h265));
-      h265.nBitrate = bitrate_bps;
-      h265.nFramerate = fps_;
-      h265.nSrcFramerate = fps_;
-      h265.nGopSize = gop_;
-      h265.nIntraPeriod = gop_;
-      h265.idr_period = gop_;
-      h265.nQPInit = 24;
-      h265.sProfileLevel.nProfile = VENC_H265ProfileMain;
-      h265.sProfileLevel.nLevel = (width_ >= 2560 || height_ >= 1440)
-                                      ? VENC_H265Level51
-                                      : VENC_H265Level41;
-      h265.sQPRange.nMinqp = 10;
-      h265.sQPRange.nMaxqp = 38;
-      h265.sQPRange.nMinPqp = 10;
-      h265.sQPRange.nMaxPqp = 38;
-      h265.sQPRange.nQpInit = 24;
-      h265.sGopParam.bUseGopCtrlEn = 1;
-      h265.sGopParam.eGopMode = AW_NORMALP;
-      h265.sRcParam.eRcMode = AW_CBR;
+      VencH265Param h265 = cedarc_common::build_h265_cbr_param(
+          width_, height_, fps_, kbs_, gop_);
 
       int ret = g_api.VideoEncSetParameter(enc_, VENC_IndexParamH265Param,
                                            &h265);
@@ -1125,6 +1058,12 @@ extern "C" int cedarc_mjpeg_h26x_supported(void) {
   const bool mem_ok = (access("/dev/dma_heap/system", R_OK | W_OK) == 0) ||
                       (access("/dev/ion", R_OK | W_OK) == 0);
   if (!ve1_ok || !ve2_ok || !mem_ok) {
+    static std::once_flag perm_warn_once;
+    std::call_once(perm_warn_once, []() {
+      LOG_WARN(std::string(
+          "Allwinner VE device found, but /dev/cedar_dev* or /dev/dma_heap/system "
+          "is not readable/writable; HW MJPEG->H26x will fall back to CPU MJPEG decode"));
+    });
     return -1;
   }
 
@@ -1154,15 +1093,19 @@ extern "C" int cedarc_mjpeg_h26x_encode(void *pipeline,
                                         const uint8_t *jpeg_data,
                                         size_t jpeg_len, int64_t pts_us,
                                         int force_idr, const uint8_t **out_data,
-                                        size_t *out_size, int *out_keyframe) {
+                                        size_t *out_size, int *out_keyframe,
+                                        int64_t *out_pts_us) {
   if (!pipeline || !out_data || !out_size || !out_keyframe) {
     set_last_error("Invalid arguments to cedarc_mjpeg_h26x_encode");
     return -1;
   }
+  if (out_pts_us) {
+    *out_pts_us = 0;
+  }
   try {
     return static_cast<CedarcMjpegH26xPipeline *>(pipeline)->encode(
         jpeg_data, jpeg_len, pts_us, force_idr, out_data, out_size,
-        out_keyframe);
+        out_keyframe, out_pts_us);
   } catch (const std::exception &e) {
     set_last_error(std::string("cedarc_mjpeg_h26x_encode exception: ") +
                    e.what());

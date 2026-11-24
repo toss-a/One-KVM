@@ -55,29 +55,34 @@ impl HwMjpegPipeline {
         data: &[u8],
         pts_ms: i64,
         force_idr: bool,
-    ) -> std::result::Result<Option<(Vec<u8>, bool)>, String> {
+    ) -> std::result::Result<Option<(Vec<u8>, bool, i64)>, String> {
         match self {
             #[cfg(feature = "rkmpp")]
             Self::Ffmpeg(p) => {
                 if force_idr {
                     p.request_keyframe();
                 }
-                p.encode(data, pts_ms).map_err(|e| {
+                p.encode(data, pts_ms)
+                    .map(|opt| opt.map(|(pkt, key)| (pkt, key, pts_ms)))
+                    .map_err(|e| {
+                        if e.is_empty() {
+                            ffmpeg_hw_last_error()
+                        } else {
+                            e
+                        }
+                    })
+            }
+            #[cfg(all(target_os = "linux", feature = "rkmpp"))]
+            Self::NativeMpp(p) => p
+                .encode(data, pts_ms, force_idr)
+                .map(|opt| opt.map(|(pkt, key)| (pkt, key, pts_ms)))
+                .map_err(|e| {
                     if e.is_empty() {
-                        ffmpeg_hw_last_error()
+                        rkmpp_native_last_error()
                     } else {
                         e
                     }
-                })
-            }
-            #[cfg(all(target_os = "linux", feature = "rkmpp"))]
-            Self::NativeMpp(p) => p.encode(data, pts_ms, force_idr).map_err(|e| {
-                if e.is_empty() {
-                    rkmpp_native_last_error()
-                } else {
-                    e
-                }
-            }),
+                }),
             #[cfg(target_os = "linux")]
             Self::Cedarc(p) => p.encode(data, pts_ms, force_idr).map_err(|e| {
                 if e.is_empty() {

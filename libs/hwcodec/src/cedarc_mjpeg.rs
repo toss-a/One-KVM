@@ -24,6 +24,7 @@ extern "C" {
         out_data: *mut *const u8,
         out_size: *mut usize,
         out_keyframe: *mut c_int,
+        out_pts_us: *mut i64,
     ) -> c_int;
     fn cedarc_mjpeg_h26x_reconfigure(pipeline: *mut c_void, kbps: c_int, gop: c_int) -> c_int;
     fn cedarc_mjpeg_h26x_free(pipeline: *mut c_void);
@@ -90,10 +91,11 @@ impl CedarcMjpegH26x {
         jpeg_data: &[u8],
         pts_ms: i64,
         force_idr: bool,
-    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+    ) -> Result<Option<(Vec<u8>, bool, i64)>, String> {
         let mut out_data = std::ptr::null();
         let mut out_size = 0usize;
         let mut out_keyframe = 0 as c_int;
+        let mut out_pts_us = 0i64;
         let ret = unsafe {
             cedarc_mjpeg_h26x_encode(
                 self.ctx.as_ptr(),
@@ -104,6 +106,7 @@ impl CedarcMjpegH26x {
                 &mut out_data,
                 &mut out_size,
                 &mut out_keyframe,
+                &mut out_pts_us,
             )
         };
         if ret != 0 {
@@ -113,7 +116,7 @@ impl CedarcMjpegH26x {
             return Ok(None);
         }
         let packet = unsafe { std::slice::from_raw_parts(out_data, out_size) }.to_vec();
-        Ok(Some((packet, out_keyframe != 0)))
+        Ok(Some((packet, out_keyframe != 0, out_pts_us / 1000)))
     }
 
     pub fn reconfigure(&mut self, kbps: u32, gop: u32) -> Result<(), String> {

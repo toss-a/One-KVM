@@ -104,7 +104,6 @@ enum VENC_INDEXTYPE {
   VENC_IndexParamH264SPSPPS = 0x101,
   VENC_IndexParamH265Param = 0x300,
   VENC_IndexParamH265Header = 0x304,
-  VENC_IndexParamH264ConstraintFlag = 0x50b,
 };
 
 enum VENC_RESULT_TYPE {
@@ -270,16 +269,6 @@ struct VencH265Param {
   int nQPInit;
   VencRcParam sRcParam;
   VencGopParam sGopParam;
-};
-
-struct VencH264ConstraintFlag {
-  unsigned char reserve_zero : 2;
-  unsigned char constraint_5 : 1;
-  unsigned char constraint_4 : 1;
-  unsigned char constraint_3 : 1;
-  unsigned char constraint_2 : 1;
-  unsigned char constraint_1 : 1;
-  unsigned char constraint_0 : 1;
 };
 
 struct VencBaseConfig {
@@ -647,7 +636,6 @@ static_assert(offsetof(VencOutputBuffer, pData1) == 40, "VencOutputBuffer.pData1
 static_assert(offsetof(VencOutputBuffer, pData2) == 80, "VencOutputBuffer.pData2 mismatch");
 static_assert(sizeof(VencAllocateBufferParam) == 12, "VencAllocateBufferParam ABI mismatch");
 static_assert(sizeof(VencHeaderData) == 16, "VencHeaderData ABI mismatch");
-static_assert(sizeof(VencH264ConstraintFlag) == 1, "VencH264ConstraintFlag ABI mismatch");
 static_assert(sizeof(user_iommu_param) == 8, "user_iommu_param ABI mismatch");
 static_assert(sizeof(ScMemOpsS) == 192, "ScMemOpsS ABI mismatch");
 static_assert(offsetof(ScMemOpsS, close) == 16, "ScMemOpsS.close mismatch");
