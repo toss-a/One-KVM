@@ -275,13 +275,16 @@ public:
     if (codec_type_ == VENC_CODEC_H264) {
       VencH264Param h264;
       std::memset(&h264, 0, sizeof(h264));
-      h264.bEntropyCodingCABAC = 0; // Constrained Baseline uses CAVLC
+      // Allwinner VE2 v2 (e.g. A733) H.264 hardware unconditionally emits
+      // High-profile 8x8 transform macroblock syntax; Baseline/Main PPS omits
+      // transform_8x8_mode_flag and produces undecodable/green streams.
+      h264.bEntropyCodingCABAC = 1;
       h264.nBitrate = bitrate_bps;
       h264.nFramerate = fps_;
       h264.nSrcFramerate = fps_;
       h264.nCodingMode = VENC_FRAME_CODING;
       h264.nMaxKeyInterval = gop_;
-      h264.sProfileLevel.nProfile = VENC_H264ProfileBaseline;
+      h264.sProfileLevel.nProfile = VENC_H264ProfileHigh;
       h264.sProfileLevel.nLevel = (width_ >= 2560 || height_ >= 1440)
                                       ? VENC_H264Level51
                                       : VENC_H264Level41;
@@ -305,15 +308,6 @@ public:
                        std::to_string(ret));
         return false;
       }
-
-      // Advertise Constrained Baseline (constraint_set0=1, constraint_set1=1)
-      // for universal WebRTC browser decoding compatibility.
-      VencH264ConstraintFlag cflag;
-      std::memset(&cflag, 0, sizeof(cflag));
-      cflag.constraint_0 = 1;
-      cflag.constraint_1 = 1;
-      g_api.VideoEncSetParameter(enc_, VENC_IndexParamH264ConstraintFlag,
-                                 &cflag);
     } else {
       VencH265Param h265;
       std::memset(&h265, 0, sizeof(h265));
