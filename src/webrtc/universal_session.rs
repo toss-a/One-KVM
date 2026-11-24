@@ -531,7 +531,9 @@ impl UniversalSession {
     ) {
         if let Some(handle) = self.video_receiver_handle.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
         }
+        self.video_track.reset_for_pipeline_switch().await;
         info!(
             "Starting {} session {} with shared encoder",
             self.codec, self.session_id

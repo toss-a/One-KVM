@@ -165,9 +165,21 @@ struct H264RtpClock {
 }
 
 impl H264RtpClock {
+    fn reset_pts_anchor(&mut self) {
+        self.last_pts_ms = None;
+    }
+
     fn next(&mut self, pts_ms: Option<i64>) -> u32 {
+        let mut reanchored = false;
         if self.started {
             let ticks = match (self.last_pts_ms, pts_ms) {
+                // A large backward PTS jump (>1s) means the upstream pipeline
+                // restarted from 0; advance by one frame interval and re-anchor
+                // instead of clamping every subsequent frame to 1 tick.
+                (Some(previous), Some(current)) if previous.saturating_sub(current) > 1000 => {
+                    reanchored = true;
+                    self.increment
+                }
                 (Some(previous), Some(current)) => {
                     current.saturating_sub(previous).saturating_mul(90).max(1) as u32
                 }
@@ -177,7 +189,11 @@ impl H264RtpClock {
         }
         self.started = true;
         if let Some(pts) = pts_ms {
-            self.last_pts_ms = Some(self.last_pts_ms.map_or(pts, |last| last.max(pts)));
+            self.last_pts_ms = if reanchored {
+                Some(pts)
+            } else {
+                Some(self.last_pts_ms.map_or(pts, |last| last.max(pts)))
+            };
         } else {
             self.last_pts_ms = None;
         }
@@ -276,6 +292,13 @@ impl UniversalVideoTrack {
 
     pub fn config(&self) -> &UniversalVideoTrackConfig {
         &self.config
+    }
+
+    pub async fn reset_for_pipeline_switch(&self) {
+        let mut state = self.h264_state.lock().await;
+        state.clock.reset_pts_anchor();
+        state.sps = None;
+        state.pps = None;
     }
 
     pub async fn write_frame_bytes(&self, data: Bytes, is_keyframe: bool) -> Result<()> {
@@ -530,6 +553,25 @@ mod tests {
         assert_eq!(clock.next(Some(2)), 92);
         assert_eq!(clock.next(None), 3092);
         assert_eq!(clock.next(None), 6092);
+    }
+
+    #[test]
+    fn h264_timestamps_survive_pipeline_pts_reset() {
+        let mut clock = test_clock(1000);
+        assert_eq!(clock.next(Some(0)), 1000);
+        assert_eq!(clock.next(Some(27_000)), 2_431_000);
+
+        // Explicit pipeline-switch reset advances smoothly by one frame increment.
+        clock.reset_pts_anchor();
+        assert_eq!(clock.next(Some(0)), 2_434_000);
+        assert_eq!(clock.next(Some(16)), 2_435_440);
+
+        // Large backward jump (>1s) without explicit reset also re-anchors cleanly.
+        let mut implicit = test_clock(1000);
+        assert_eq!(implicit.next(Some(0)), 1000);
+        assert_eq!(implicit.next(Some(27_000)), 2_431_000);
+        assert_eq!(implicit.next(Some(0)), 2_434_000);
+        assert_eq!(implicit.next(Some(16)), 2_435_440);
     }
 
     #[test]
