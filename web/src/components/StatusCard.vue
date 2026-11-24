@@ -15,11 +15,11 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
-import { Monitor, Video, Usb, AlertCircle, CheckCircle, Loader2, Volume2, HardDrive, MonitorOff, Clock } from 'lucide-vue-next'
+import { Monitor, Video, Usb, AlertCircle, CheckCircle, Loader2, Volume2, HardDrive, MonitorOff, Clock, Power } from 'lucide-vue-next'
 
 const { t } = useI18n()
 
-export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | 'error' | 'no_signal' | 'busy'
+export type ConnectionStatus = 'connected' | 'connecting' | 'disconnected' | 'error' | 'no_signal' | 'busy' | 'unknown'
 
 export interface StatusDetail {
   label: string
@@ -29,9 +29,10 @@ export interface StatusDetail {
 
 const props = withDefaults(defineProps<{
   title: string
-  type: 'device' | 'video' | 'hid' | 'audio' | 'msd'
+  type: 'device' | 'video' | 'hid' | 'audio' | 'msd' | 'power' | 'hdd'
   status: ConnectionStatus
   quickInfo?: string  // Quick info displayed on trigger (e.g., "1920x1080 30fps")
+  badgeText?: string
   subtitle?: string
   errorMessage?: string
   details?: StatusDetail[]
@@ -58,6 +59,7 @@ const statusColor = computed(() => {
       return 'bg-warning animate-pulse'
     case 'no_signal':
     case 'busy':
+    case 'unknown':
       return 'bg-warning'
     case 'disconnected':
       return 'bg-muted-foreground'
@@ -79,6 +81,10 @@ const StatusIcon = computed(() => {
     case 'audio':
       return Volume2
     case 'msd':
+      return HardDrive
+    case 'power':
+      return Power
+    case 'hdd':
       return HardDrive
     default:
       return Monitor
@@ -102,7 +108,7 @@ const statusIcon = computed(() => {
   }
 })
 
-const isNotice = computed(() => ['no_signal', 'busy'].includes(props.status))
+const isNotice = computed(() => ['no_signal', 'busy', 'unknown'].includes(props.status))
 
 const statusText = computed(() => {
   switch (props.status) {
@@ -114,6 +120,8 @@ const statusText = computed(() => {
       return t('status.disconnected')
     case 'error':
       return t('status.error')
+    case 'unknown':
+      return t('common.unknown')
     case 'no_signal':
     case 'busy':
       return t(`status.${props.status}`)
@@ -123,6 +131,7 @@ const statusText = computed(() => {
 })
 
 const statusBadgeText = computed(() => {
+  if (props.badgeText) return props.badgeText
   switch (props.status) {
     case 'connected':
       return t('statusCard.online')
@@ -132,6 +141,8 @@ const statusBadgeText = computed(() => {
       return t('statusCard.offline')
     case 'error':
       return t('status.error')
+    case 'unknown':
+      return t('common.unknown')
     case 'no_signal':
     case 'busy':
       return t(`status.${props.status}`)
@@ -185,6 +196,7 @@ const statusBadgeText = computed(() => {
             'rounded-md p-2',
             status === 'connected' ? 'bg-success/10 text-success' :
             status === 'error' ? 'bg-destructive/10 text-destructive' :
+            status === 'unknown' ? 'bg-warning/10 text-warning' :
             'bg-muted text-muted-foreground'
           )">
             <component :is="StatusIcon" class="size-5" />
@@ -275,6 +287,7 @@ const statusBadgeText = computed(() => {
             'rounded-md p-2',
             status === 'connected' ? 'bg-success/10 text-success' :
             status === 'error' ? 'bg-destructive/10 text-destructive' :
+            status === 'unknown' ? 'bg-warning/10 text-warning' :
             'bg-muted text-muted-foreground'
           )">
             <component :is="StatusIcon" class="size-5" />

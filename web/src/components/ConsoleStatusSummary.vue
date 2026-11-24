@@ -10,6 +10,7 @@ export interface ConsoleStatusItem {
   id: string
   title: string
   status: ConnectionStatus
+  statusText?: string
   quickInfo: string
   details: StatusDetail[]
   errorMessage?: string
@@ -38,6 +39,7 @@ function dotClass(status: ConsoleStatusItem['status']) {
     error: 'bg-destructive',
     no_signal: 'bg-warning',
     busy: 'bg-warning',
+    unknown: 'bg-warning',
   }[status]
 }
 </script>
@@ -69,7 +71,7 @@ function dotClass(status: ConsoleStatusItem['status']) {
             <span class="font-medium">{{ item.title }}</span>
             <span class="flex items-center gap-1.5 text-xs">
               <span class="size-1.5 rounded-full" :class="dotClass(item.status)" />
-              {{ t(`status.${item.status}`) }}
+              {{ item.statusText || (item.status === 'unknown' ? t('common.unknown') : t(`status.${item.status}`)) }}
             </span>
           </div>
           <p v-if="item.quickInfo" class="text-xs text-muted-foreground">{{ item.quickInfo }}</p>

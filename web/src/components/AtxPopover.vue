@@ -1,13 +1,12 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Power, RotateCcw, CircleDot, Wifi, Send, HardDrive } from 'lucide-vue-next'
-import { atxApi } from '@/api'
+import { Power, RotateCcw, CircleDot, Wifi, Send } from 'lucide-vue-next'
 import { atxConfigApi } from '@/api/config'
 
 type AtxAction = 'short' | 'long' | 'reset'
@@ -40,9 +39,6 @@ const activeTab = ref(props.atxEnabled ? 'atx' : 'wol')
 const showAtxControls = computed(() => props.atxEnabled)
 const tabTriggerClass = 'h-8 rounded-md border-0 bg-transparent text-center text-xs text-muted-foreground shadow-none hover:text-foreground data-[state=active]:border-0 data-[state=active]:bg-background data-[state=active]:text-foreground data-[state=active]:shadow-sm'
 
-const powerState = ref<'on' | 'off' | 'unknown'>('unknown')
-const hddState = ref<'active' | 'inactive' | 'unknown'>('unknown')
-let powerStateTimer: number | null = null
 let actionTimer: number | null = null
 
 const wolMacAddress = ref('')
@@ -52,52 +48,6 @@ const wolLoadingHistory = ref(false)
 const activeAction = ref<AtxAction | null>(null)
 
 const actionBusy = computed(() => activeAction.value !== null)
-
-const powerStateIconColor = computed(() => {
-  switch (powerState.value) {
-    case 'on': return 'text-success'
-    case 'off': return 'text-muted-foreground'
-    default: return 'text-warning'
-  }
-})
-
-const powerStateTextColor = computed(() => {
-  switch (powerState.value) {
-    case 'on': return 'text-success'
-    default: return ''
-  }
-})
-
-const powerStateText = computed(() => {
-  switch (powerState.value) {
-    case 'on': return t('atx.stateOn')
-    case 'off': return t('atx.stateOff')
-    default: return t('atx.stateUnknown')
-  }
-})
-
-const hddStateIconColor = computed(() => {
-  switch (hddState.value) {
-    case 'active': return 'text-success'
-    case 'inactive': return 'text-muted-foreground'
-    default: return 'text-warning'
-  }
-})
-
-const hddStateTextColor = computed(() => {
-  switch (hddState.value) {
-    case 'active': return 'text-success'
-    default: return ''
-  }
-})
-
-const hddStateText = computed(() => {
-  switch (hddState.value) {
-    case 'active': return t('atx.hddActive')
-    case 'inactive': return t('atx.hddInactive')
-    default: return t('atx.stateUnknown')
-  }
-})
 
 function handleAction(action: AtxAction) {
   if (actionBusy.value) return
@@ -115,7 +65,6 @@ function handleAction(action: AtxAction) {
   actionTimer = window.setTimeout(() => {
     activeAction.value = null
     actionTimer = null
-    refreshPowerState().catch(() => {})
   }, Math.max(actionDurations[action], minActionFeedbackMs))
 }
 
@@ -164,29 +113,7 @@ async function loadWolHistory() {
   }
 }
 
-async function refreshPowerState() {
-  try {
-    const state = await atxApi.status()
-    powerState.value = state.power_status
-    hddState.value = state.hdd_status
-  } catch {
-    powerState.value = 'unknown'
-    hddState.value = 'unknown'
-  }
-}
-
-onMounted(() => {
-  refreshPowerState().catch(() => {})
-  powerStateTimer = window.setInterval(() => {
-    refreshPowerState().catch(() => {})
-  }, 3000)
-})
-
 onUnmounted(() => {
-  if (powerStateTimer !== null) {
-    window.clearInterval(powerStateTimer)
-    powerStateTimer = null
-  }
   if (actionTimer !== null) {
     window.clearTimeout(actionTimer)
     actionTimer = null
@@ -231,26 +158,6 @@ watch(showAtxControls, (enabled) => {
 
       <!-- ATX Tab -->
       <TabsContent v-if="showAtxControls" value="atx" class="mt-2.5 space-y-2.5">
-        <!-- Status -->
-        <div class="grid grid-cols-2 gap-2">
-          <div class="flex min-w-0 items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-            <Power :class="['size-4 shrink-0', powerStateIconColor]" />
-            <div class="min-w-0">
-              <p class="truncate text-[11px] leading-none text-muted-foreground">{{ t('atx.powerState') }}</p>
-              <p :class="['mt-1 truncate text-xs font-medium leading-none', powerStateTextColor]">{{ powerStateText }}</p>
-            </div>
-          </div>
-          <div class="flex min-w-0 items-center gap-2 rounded-md border bg-muted/40 px-2 py-1.5">
-            <HardDrive :class="['size-4 shrink-0', hddStateIconColor]" />
-            <div class="min-w-0">
-              <p class="truncate text-[11px] leading-none text-muted-foreground">{{ t('atx.hddState') }}</p>
-              <p :class="['mt-1 truncate text-xs font-medium leading-none', hddStateTextColor]">{{ hddStateText }}</p>
-            </div>
-          </div>
-        </div>
-
-        <Separator />
-
         <!-- Power Actions -->
         <div class="space-y-1">
           <Button

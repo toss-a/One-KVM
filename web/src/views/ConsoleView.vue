@@ -251,8 +251,76 @@ const { consoleLayout } = useConsoleLayout()
 provideConsoleAppearance(consoleLayout)
 const terminalAvailable = computed(() => ttydStatus.value?.available !== false)
 const showPower = computed(() => featureVisibility.value.power)
+const showAtxStatusCards = computed(() => showPower.value && systemStore.atx?.available === true)
 const showTerminal = computed(() => terminalAvailable.value && featureVisibility.value.webTerminal)
 const showPasteText = computed(() => featureVisibility.value.pasteText)
+
+const powerStateValue = computed(() => systemStore.atx?.powerStatus ?? 'unknown')
+const hddStateValue = computed(() => systemStore.atx?.hddStatus ?? 'unknown')
+
+const powerCardStatus = computed<ConnectionStatus>(() => (
+  powerStateValue.value === 'on'
+    ? 'connected'
+    : powerStateValue.value === 'off'
+      ? 'disconnected'
+      : 'unknown'
+))
+
+const hddCardStatus = computed<ConnectionStatus>(() => (
+  hddStateValue.value === 'active'
+    ? 'connected'
+    : hddStateValue.value === 'inactive'
+      ? 'disconnected'
+      : 'unknown'
+))
+
+const powerQuickInfo = computed(() => {
+  switch (powerStateValue.value) {
+    case 'on':
+      return t('atx.stateOn')
+    case 'off':
+      return t('atx.stateOff')
+    default:
+      return t('atx.stateUnknown')
+  }
+})
+
+const hddQuickInfo = computed(() => {
+  switch (hddStateValue.value) {
+    case 'active':
+      return t('atx.hddActive')
+    case 'inactive':
+      return t('atx.hddInactive')
+    default:
+      return t('atx.stateUnknown')
+  }
+})
+
+const powerDetails = computed<StatusDetail[]>(() => [
+  { label: t('statusCard.backend'), value: systemStore.atx?.backend || t('common.unknown') },
+  {
+    label: t('atx.powerState'),
+    value: powerQuickInfo.value,
+    status: powerStateValue.value === 'on'
+      ? 'ok'
+      : powerStateValue.value === 'unknown'
+        ? 'warning'
+        : undefined,
+  },
+])
+
+const hddDetails = computed<StatusDetail[]>(() => [
+  { label: t('statusCard.backend'), value: systemStore.atx?.backend || t('common.unknown') },
+  {
+    label: t('atx.hddState'),
+    value: hddQuickInfo.value,
+    status: hddStateValue.value === 'active'
+      ? 'ok'
+      : hddStateValue.value === 'unknown'
+        ? 'warning'
+        : undefined,
+  },
+])
 
 const videoStatus = computed<ConnectionStatus>(() => {
   if (wsNetworkError.value) return 'connecting'
@@ -273,7 +341,28 @@ const videoStatus = computed<ConnectionStatus>(() => {
 
 // Optional idle devices are neutral; video and HID must stay visible when unavailable.
 const consoleStatusItems = computed<ConsoleStatusItem[]>(() => {
-  const items: ConsoleStatusItem[] = [
+  const items: ConsoleStatusItem[] = []
+  if (showAtxStatusCards.value) {
+    items.push(
+      {
+        id: 'power',
+        title: t('atx.powerState'),
+        status: powerCardStatus.value,
+        statusText: powerQuickInfo.value,
+        quickInfo: '',
+        details: powerDetails.value,
+      },
+      {
+        id: 'hdd',
+        title: t('atx.hddState'),
+        status: hddCardStatus.value,
+        statusText: hddQuickInfo.value,
+        quickInfo: '',
+        details: hddDetails.value,
+      },
+    )
+  }
+  items.push(
     { id: 'video', title: t('statusCard.video'), status: videoStatus.value,
       quickInfo: videoQuickInfo.value, details: videoDetails.value, required: true,
       errorMessage: showSignalOverlay.value ? signalOverlayInfo.value.title : videoErrorMessage.value },
@@ -281,7 +370,7 @@ const consoleStatusItems = computed<ConsoleStatusItem[]>(() => {
       quickInfo: audioQuickInfo.value, details: audioDetails.value, errorMessage: audioErrorMessage.value },
     { id: 'hid', title: t('statusCard.hid'), status: hidStatus.value,
       quickInfo: hidQuickInfo.value, details: hidDetails.value, errorMessage: hidErrorMessage.value, required: true },
-  ]
+  )
   if (showMsdStatusCard.value) items.push({
     id: 'msd', title: t('statusCard.msd'), status: msdStatus.value,
     quickInfo: msdQuickInfo.value, details: msdDetails.value, errorMessage: msdErrorMessage.value,
@@ -3052,6 +3141,35 @@ async function refreshUacAvailability() {
   }
 }
 
+let atxPollTimer: number | null = null
+
+function stopAtxPolling() {
+  if (atxPollTimer !== null) {
+    window.clearInterval(atxPollTimer)
+    atxPollTimer = null
+  }
+}
+
+function startAtxPolling() {
+  stopAtxPolling()
+  void systemStore.fetchAtxState().catch(() => {})
+  atxPollTimer = window.setInterval(() => {
+    void systemStore.fetchAtxState().catch(() => {})
+  }, 3000)
+}
+
+watch(
+  [isConsoleActive, showAtxStatusCards],
+  ([active, visible]) => {
+    if (active && visible) {
+      startAtxPolling()
+    } else {
+      stopAtxPolling()
+    }
+  },
+  { immediate: true },
+)
+
 watch(microphoneTransferEnabled, enabled => {
   if (!enabled) void microphone.stop()
 })
@@ -3111,6 +3229,7 @@ onDeactivated(() => {
 })
 
 onUnmounted(() => {
+  stopAtxPolling()
   deactivateConsoleView()
 
   initialDeviceInfoReceived = false
@@ -3162,7 +3281,27 @@ onUnmounted(() => {
               :items="consoleStatusItems"
               :show-video-info="consoleLayout === 'sidebar'"
             />
-            <div v-else class="flex md:hidden items-center gap-1">
+            <div v-else class="flex md:hidden min-w-0 items-center gap-1">
+              <StatusCard
+                v-if="showAtxStatusCards"
+                :title="t('atx.powerState')"
+                type="power"
+                :status="powerCardStatus"
+                :quick-info="powerQuickInfo"
+                :badge-text="powerQuickInfo"
+                :details="powerDetails"
+                compact
+              />
+              <StatusCard
+                v-if="showAtxStatusCards"
+                :title="t('atx.hddState')"
+                type="hdd"
+                :status="hddCardStatus"
+                :quick-info="hddQuickInfo"
+                :badge-text="hddQuickInfo"
+                :details="hddDetails"
+                compact
+              />
               <StatusCard
                 :title="t('statusCard.video')"
                 type="video"
@@ -3198,6 +3337,24 @@ onUnmounted(() => {
 
             />
             <div v-if="consoleLayout === 'current'" class="hidden md:flex items-center gap-2">
+              <StatusCard
+                v-if="showAtxStatusCards"
+                :title="t('atx.powerState')"
+                type="power"
+                :status="powerCardStatus"
+                :quick-info="powerQuickInfo"
+                :badge-text="powerQuickInfo"
+                :details="powerDetails"
+              />
+              <StatusCard
+                v-if="showAtxStatusCards"
+                :title="t('atx.hddState')"
+                type="hdd"
+                :status="hddCardStatus"
+                :quick-info="hddQuickInfo"
+                :badge-text="hddQuickInfo"
+                :details="hddDetails"
+              />
               <StatusCard
                 :title="t('statusCard.video')"
                 type="video"

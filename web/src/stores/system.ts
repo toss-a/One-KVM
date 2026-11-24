@@ -46,12 +46,18 @@ interface HidState {
   errorCode: string | null
 }
 
+export type AtxPowerStatus = 'on' | 'off' | 'unknown'
+export type AtxHddStatus = 'active' | 'inactive' | 'unknown'
+
 interface AtxState {
   available: boolean
   backend: string
   initialized: boolean
   powerOn: boolean
-  hddStatus: 'active' | 'inactive' | 'unknown'
+  powerStatus: AtxPowerStatus
+  ledSupported: boolean
+  hddStatus: AtxHddStatus
+  hddSupported: boolean
   error: string | null
 }
 
@@ -251,7 +257,10 @@ export const useSystemStore = defineStore('system', () => {
         backend: state.backend,
         initialized: state.initialized,
         powerOn: state.power_status === 'on',
+        powerStatus: state.power_status,
+        ledSupported: state.led_supported,
         hddStatus: state.hdd_status,
+        hddSupported: state.hdd_supported,
         error: null,
       }
       return state
@@ -398,12 +407,24 @@ export const useSystemStore = defineStore('system', () => {
 
     // Update ATX state (optional)
     if (data.atx) {
+      const prev = atx.value
+      const sameBackend = prev?.backend === data.atx.backend
+      const ledSupported = sameBackend ? prev.ledSupported : false
+      const hddSupported = sameBackend ? prev.hddSupported : false
+      const powerStatus: AtxPowerStatus = data.atx.power_on
+        ? 'on'
+        : ((sameBackend && prev?.powerStatus === 'off') || ledSupported)
+          ? 'off'
+          : 'unknown'
       atx.value = {
         available: data.atx.available,
         backend: data.atx.backend,
         initialized: data.atx.initialized,
         powerOn: data.atx.power_on,
+        powerStatus,
+        ledSupported,
         hddStatus: data.atx.hdd_status,
+        hddSupported,
         error: data.atx.error,
       }
     } else {
